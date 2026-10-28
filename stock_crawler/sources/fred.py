@@ -24,6 +24,10 @@ SERIES = (
     ("UNRATE", "US unemployment rate", "%", "pp", "M4"),
     ("DCOILWTICO", "WTI crude oil", "USD/barrel", "percent", "M5"),
     ("DTWEXBGS", "Broad US dollar index", "index", "percent", "M6"),
+    ("GDPC1", "US real GDP growth, year over year", "%", "pp", "M7"),
+    ("T10Y2Y", "US 10-year minus 2-year yield spread", "pp", "pp", "M8"),
+    ("BAMLH0A0HYM2", "US high-yield credit spread", "%", "pp", "M9"),
+    ("VIXCLS", "CBOE volatility index", "index", "percent", "M10"),
 )
 
 
@@ -36,8 +40,8 @@ def _at_or_before(points: list[tuple[date, float]], target: date, max_gap: int =
 
 
 def _same_month(points: list[tuple[date, float]], target: date) -> tuple[date, float] | None:
-    # CPI year-over-year must compare the same calendar month, not merely a
-    # nearby earlier observation (which could silently become 13-month growth).
+    # CPI and quarterly GDP year-over-year must compare the same calendar
+    # month, not a nearby earlier observation from a different period.
     matches = [point for point in points if point[0].year == target.year and point[0].month == target.month]
     return matches[-1] if matches else None
 
@@ -59,10 +63,10 @@ def parse_series(code: str, label: str, unit: str, kind: str, source_id: str, cs
     prior = _at_or_before(points, latest_date - relativedelta(months=3))
     comparison_date = prior[0] if prior else None
 
-    if code == "CPIAUCSL":
+    if code in {"CPIAUCSL", "GDPC1"}:
         year_ago = _same_month(points, latest_date - relativedelta(years=1))
         if not year_ago or year_ago[1] <= 0:
-            raise ValueError("Not enough CPI history to calculate year-over-year inflation")
+            raise ValueError(f"Not enough {'CPI' if code == 'CPIAUCSL' else 'GDP'} history to calculate year-over-year growth")
         value = (latest / year_ago[1] - 1) * 100
         change = None
         if prior:
@@ -108,7 +112,7 @@ def _fetch_one(spec: tuple[str, str, str, str, str]) -> MacroPoint:
 def fetch_macro() -> tuple[dict[str, MacroPoint], list[str]]:
     results: dict[str, MacroPoint] = {}
     failed: list[str] = []
-    with ThreadPoolExecutor(max_workers=len(SERIES), thread_name_prefix="fred") as executor:
+    with ThreadPoolExecutor(max_workers=min(6, len(SERIES)), thread_name_prefix="fred") as executor:
         futures = {executor.submit(_fetch_one, spec): spec for spec in SERIES}
         for future in as_completed(futures):
             spec = futures[future]

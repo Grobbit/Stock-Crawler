@@ -10,15 +10,17 @@ from datetime import timedelta
 from dateutil.relativedelta import relativedelta
 
 from stock_crawler.models import Analysis, Factor, Scenario, Snapshot
+from stock_crawler.research_context import election_reactions, headline_sentiment, next_general_election, policy_channels, positioning
 from stock_crawler.utils import MINOR_UNIT_CURRENCIES, compact, days_old, number, pct, text
 
 WEIGHTS = {
-    "growth": 0.18,
-    "profitability": 0.16,
-    "balance": 0.12,
-    "valuation": 0.12,
+    "growth": 0.17,
+    "profitability": 0.14,
+    "balance": 0.10,
+    "valuation": 0.10,
     "momentum": 0.12,
-    "analysts": 0.10,
+    "analysts": 0.09,
+    "headlines": 0.08,
     "macro": 0.20,
 }
 # Explicit, fixed heuristic anchors, NOT observed sector averages or peer data.
@@ -207,6 +209,16 @@ def analyze(snapshot: Snapshot) -> Analysis:
         analyst_score = None
         analyst_evidence = "A provider recommendation mean with at least three analysts is required; unavailable or too few analysts."
     add("analysts", "Analyst sentiment", analyst_score, analyst_evidence, "A")
+    sentiment = headline_sentiment(snapshot)
+    headline_score = _clamp(sentiment.average * 2) if is_equity and sentiment.average is not None else None
+    if headline_score is not None:
+        headline_evidence = (f"{len(sentiment.headlines)} provider-tagged or issuer-name-matched headlines from the past 30 days; "
+                             f"average VADER tone {sentiment.average:+.2f}, with {sentiment.positive_count} positive, "
+                             f"{sentiment.neutral_count} neutral and {sentiment.negative_count} negative. "
+                             "This is a small, unverified headline sample, not overall investor or social-media sentiment.")
+    else:
+        headline_evidence = "At least five dated, issuer-matched headlines within 30 days are required; the headline-tone signal is unavailable."
+    add("headlines", "News headline tone", headline_score, headline_evidence, "N")
     macro_score, macro_evidence = _macro_score(snapshot)
     add("macro", "Macro backdrop", macro_score, macro_evidence, "M")
 
@@ -265,6 +277,8 @@ def analyze(snapshot: Snapshot) -> Analysis:
         limitations.append("The latest close is more than 14 calendar days old; the verdict and price target are withheld.")
     if macro_score is None:
         limitations.append("The macro overlay lacks at least two recent relevant observations; the verdict and price target are withheld.")
+    if is_equity and headline_score is None:
+        limitations.append("Fewer than five dated, issuer-matched headlines from the past 30 days were available; headline tone is not scored.")
     if fundamental_count < 2:
         limitations.append("Fewer than two company fundamental factors are available; the verdict and price target are withheld.")
     if coverage < 0.65 - 1e-9:
@@ -277,5 +291,9 @@ def analyze(snapshot: Snapshot) -> Analysis:
     limitations.append("This is an uncalibrated, rules-based scenario exercise, not a statistically validated forecast or personalized investment advice.")
     # Preserve order while avoiding duplicate caveats.
     limitations = list(dict.fromkeys(limitations))
+    limitations.append("Election-window returns are descriptive correlations, not evidence that a politician or election caused a price move; policy channels are conditional.")
     return Analysis(factors, coverage, score, verdict, target, target_date, expected_return, scenarios, spread, spread_basis,
-                    _macro_channels(snapshot), positives, negatives, limitations, returns, stale)
+                    _macro_channels(snapshot), positives, negatives, limitations, returns, stale,
+                    sentiment=sentiment, election_reactions=election_reactions(snapshot),
+                    next_election=next_general_election(snapshot.fetched_at.date()), positioning=positioning(snapshot),
+                    policy_channels=policy_channels(snapshot))

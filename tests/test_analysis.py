@@ -28,7 +28,8 @@ def test_bearish_data_produces_bearish_conclusion_not_perpetual_hedging():
     snapshot = demo_snapshot()
     snapshot.info.update({"revenueGrowth": -0.25, "operatingMargins": -0.2, "totalDebt": 20e9,
                           "totalCash": 1e9, "forwardPE": 90, "recommendationMean": 4.8})
-    snapshot.prices = [PricePoint(point.date, 200 - index * 0.35) for index, point in enumerate(snapshot.prices)]
+    snapshot.prices = [PricePoint(point.date, 200 - index * 0.04, 200 - index * 0.04, point.volume)
+                       for index, point in enumerate(snapshot.prices)]
     for code in ("DGS10", "UNRATE", "CPIAUCSL"):
         snapshot.macro[code] = replace(snapshot.macro[code], change_3m=1.0)
     analysis = analyze(snapshot)
@@ -67,7 +68,7 @@ def test_old_macro_series_and_missing_fundamentals_are_not_imputed():
     analysis = analyze(snapshot)
     assert analysis.verdict == "Insufficient evidence"
     assert analysis.target is None
-    assert analysis.coverage == pytest.approx(WEIGHTS["momentum"] + WEIGHTS["analysts"] + WEIGHTS["macro"])
+    assert analysis.coverage == pytest.approx(WEIGHTS["momentum"] + WEIGHTS["analysts"] + WEIGHTS["headlines"] + WEIGHTS["macro"])
 
 
 def test_macro_inputs_actually_change_model_and_target():

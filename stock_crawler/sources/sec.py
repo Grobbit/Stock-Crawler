@@ -32,7 +32,7 @@ def _filing_text(content: bytes) -> str:
     return re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()
 
 
-def extract_excerpts(content: bytes) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def extract_excerpts(content: bytes) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     """Return verbatim, bounded snippets, not inferred or invented customers.
 
     SEC HTML varies considerably. These are explicitly presented as excerpts and
@@ -75,7 +75,9 @@ def extract_excerpts(content: bytes) -> tuple[tuple[str, ...], tuple[str, ...]]:
 
     customers = find(r"\bcustomers?\b", r"revenue|sales|accounted|concentrat|purchas|products?|services?", 2)
     risks = find(r"\b(?:competition|cybersecurity|supply chain|regulat\w*|risk factors?)\b", r"may|could|risk|advers|affect|depend", 2)
-    return customers, risks
+    policies = find(r"\b(?:tariffs?|export controls?|government contracts?|reimbursement|federal funding|sanctions|tax credits?)\b",
+                    r"revenue|sales|business|cost|demand|operations|risk|could|may|regulat|government", 2)
+    return customers, risks, policies
 
 
 def fetch_filing(ticker: str, agent: str) -> tuple[Filing | None, list[str]]:
@@ -119,8 +121,8 @@ def fetch_filing(ticker: str, agent: str) -> tuple[Filing | None, list[str]]:
             chunks.append(chunk)
             size += len(chunk)
         response.close()
-        customers, risks = extract_excerpts(b"".join(chunks))
+        customers, risks, policies = extract_excerpts(b"".join(chunks))
         warnings = ["Only the first 10 MB of the SEC filing was searched; review the complete filing for context."] if truncated else []
-        return Filing(form, filing_date, report_date, url, customers, risks, truncated), warnings
+        return Filing(form, filing_date, report_date, url, customers, risks, truncated, policies), warnings
     except (requests.RequestException, ValueError, KeyError, IndexError, TypeError, OSError):
         return None, ["The SEC filing could not be retrieved or parsed. Review the issuer's investor-relations filings directly."]

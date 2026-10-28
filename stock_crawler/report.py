@@ -1,4 +1,4 @@
-"""Generate a structured, sourced 17-section research PDF."""
+"""Generate a structured, sourced research PDF with policy and sentiment context."""
 from __future__ import annotations
 
 import html
@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from urllib.parse import quote
 
+from dateutil.relativedelta import relativedelta
 import reportlab
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
@@ -69,7 +70,7 @@ def _ref(snapshot: Snapshot, source: str) -> str:
 
 
 def _demo_refs(snapshot: Snapshot, value: str) -> str:
-    return re.sub(r"\[(?:M\d|Q|H|A|F|S|N)\]", "[D]", value) if snapshot.demo else value
+    return re.sub(r"\[(?:M\d+|Q|H|A|F|S|N|P|E|B|O|V)\]", "[D]", value) if snapshot.demo else value
 
 
 def _factor_evidence(snapshot: Snapshot, factor: Factor) -> str:
@@ -129,7 +130,8 @@ class PriceChart(Flowable):
 
     def draw(self) -> None:
         canvas = self.canv
-        points = self.snapshot.prices
+        cutoff = self.snapshot.price_date - relativedelta(years=1)
+        points = [point for point in self.snapshot.prices if point.date >= cutoff]
         if not points:
             return
         left, right, bottom, top = 8, self.width - 8, 24, self.height - 17
@@ -212,6 +214,8 @@ def _short_factor_score(score: float | None) -> str:
 def _macro_value(value: float, unit: str) -> str:
     if unit == "%":
         return f"{value:.2f}%"
+    if unit == "pp":
+        return f"{value:+.2f} pp"
     if unit == "USD/barrel":
         return f"USD {value:.2f}/bbl"
     return f"{value:.2f}"
@@ -228,6 +232,153 @@ def _macro_change(point) -> str:
 def _source_link(title: str, url: str) -> str:
     return f'<link href="{_esc(url)}" color="#116b56">{_esc(title)}</link>' if url else _esc(title)
 
+
+
+def _positioning_page(story: list, snapshot: Snapshot, analysis: Analysis) -> None:
+    _heading(story, 9, "Market positioning & risk", "Sentiment is more than a headline: compare trading activity, short interest and option positioning.")
+    info, pos = snapshot.info, analysis.positioning
+    interest_day = date_from_timestamp(info.get("dateShortInterest"))
+    short_float = number(info.get("shortPercentOfFloat"))
+    if short_float is not None and not 0 <= short_float <= 1:
+        short_float = None
+    institutional = number(info.get("heldPercentInstitutions"))
+    if institutional is not None and not 0 <= institutional <= 1:
+        institutional = None
+    rows = [
+        ["20-day vs prior 60-day volume", f"{pos['volume_ratio']:.2f}x" if pos.get("volume_ratio") is not None else "Not available"],
+        ["Adjusted close vs 50-day average", pct(pos.get("vs_ma50"), signed=True)],
+        ["Adjusted close vs 200-day average", pct(pos.get("vs_ma200"), signed=True)],
+        ["63-day realized volatility, annualized", pct(pos.get("volatility_63d"))],
+        ["Shares sold short / float", pct(short_float) + (f" (as of {interest_day})" if interest_day else " (date not supplied)" if short_float is not None else "")],
+        ["Shares short / previous observation", f"{compact(number(info.get('sharesShort')))} / {compact(number(info.get('sharesShortPriorMonth')))}"],
+        ["Days to cover, provider-reported", _value(info, "shortRatio", lambda v: f"{v:.2f} days")],
+        ["Institutional ownership", pct(institutional)],
+    ]
+    story.append(_table(["Positioning measure", "Observation"], rows, [285, 225], small=True))
+    story.append(Spacer(1, 9))
+    options = snapshot.options
+    if options:
+        ratio = f"{pos['put_call_oi']:.2f}x" if pos.get("put_call_oi") is not None else "Unavailable: incomplete or zero call open interest"
+        story.append(_p("Options open interest " + _ref(snapshot, "O"), "section"))
+        story.append(_p(f"Selected expiration: {options.expiration}. Known call open interest: {options.call_open_interest:,} across {options.call_known}/{options.call_total} contracts; known put open interest: {options.put_open_interest:,} across {options.put_known}/{options.put_total}. Put/call open-interest ratio: {ratio}. Retrieved {options.retrieved_at.strftime('%Y-%m-%d %H:%M UTC')}; provider values may be delayed.", "small"))
+    else:
+        story.append(_p("Options positioning for a suitable expiration was unavailable; no put/call ratio was invented.", "small"))
+    refs = " ".join(dict.fromkeys((_ref(snapshot, "H"), _ref(snapshot, "Q"))))
+    story.append(_note("Volume is a trading-activity proxy, not buy-versus-sell flow. Short interest is a delayed snapshot; options open interest may reflect hedges or spreads, not directional bets. A ratio is withheld unless all contracts in both selected sides have valid open interest. These measures do not identify who is bullish or bearish. " + refs))
+
+
+def _sentiment_page(story: list, snapshot: Snapshot, analysis: Analysis) -> None:
+    _heading(story, 10, "News tone & sentiment trends", "A measurable—but narrow—view of the language in provider-linked headlines.")
+    sentiment = analysis.sentiment
+    if sentiment and sentiment.headlines:
+        overall = f"{sentiment.average:+.2f}" if sentiment.average is not None else "Insufficient sample"
+        story.append(_metrics([("30-day headlines", str(len(sentiment.headlines))), ("Average tone", overall),
+                               ("Positive / neutral / negative", f"{sentiment.positive_count} / {sentiment.neutral_count} / {sentiment.negative_count}")]))
+        story.append(Spacer(1, 11))
+        if sentiment.recent_average is not None and sentiment.prior_average is not None:
+            trend = (f"Days 0–7: average {sentiment.recent_average:+.2f} from {sentiment.recent_count} headlines; "
+                     f"days 8–30: {sentiment.prior_average:+.2f} from {sentiment.prior_count}. "
+                     "This compares two small, potentially different samples, not a measured shift in all investors' views.")
+        else:
+            trend = (f"Recent window: {sentiment.recent_count} headlines; earlier window: {sentiment.prior_count}. "
+                     "At least three in each window are required to compare tone over time.")
+        story.append(_p(trend, "body"))
+        story.append(_p("Eligible, issuer-matched headlines " + _ref(snapshot, "N"), "section"))
+        for headline in sentiment.headlines:
+            item = headline.item
+            link = _source_link(text(item.title, 160), item.url)
+            story.append(_rich(f"{link} <font color='#60726e'>— {_esc(item.publisher)}, {headline.published_date}, {_esc(headline.tone.lower())} ({headline.compound:+.2f})</font>", "small"))
+    else:
+        story.append(_note("No eligible, issuer-matched dated headlines from the past 30 days were available. A news-tone score and trend are not invented."))
+        story.append(Spacer(1, 8))
+    story.append(Spacer(1, 5))
+    story.append(_p(_factor_evidence(snapshot, next(f for f in analysis.factors if f.key == "headlines")), "small"))
+    story.append(_note("Tone uses English-language VADER with a small disclosed finance-word override. Headlines must match a provider ticker tag or company name/ticker, but this imperfect filter and the model can misread context, sarcasm or unknown-language text. Five matched headlines are needed for the 8% factor and three per time bucket for a trend. This is not a social-media poll or market-wide sentiment. " + _ref(snapshot, "V")))
+
+
+def _politics_page(story: list, snapshot: Snapshot, analysis: Analysis) -> None:
+    _heading(story, 13, "Elections & elected officials", "A nonpartisan snapshot of US policymakers and the next scheduled federal general election.")
+    political = snapshot.politics
+    if political and (political.executives or political.leaders or political.headquarters_senators):
+        rows = [[text(item.role, 45), text(item.name, 60), text(item.party, 35), item.start.isoformat()]
+                for item in (political.executives[:2] + political.leaders[:5])]
+        if rows:
+            story.append(_table(["Office / leadership role", "Officeholder", "Party", "Role since"], rows, [175, 145, 100, 90], small=True))
+            story.append(Spacer(1, 6))
+        else:
+            story.append(_p("Current executive and congressional leadership records were unavailable.", "small"))
+        retrieved = political.retrieved_at.strftime("%Y-%m-%d %H:%M UTC") if political.retrieved_at else "date not provided"
+        if snapshot.demo:
+            source_note = f"These officials and terms are fictional demo data generated {retrieved}. {_ref(snapshot, 'P')}"
+        else:
+            source_note = (f"The oldest available political dataset was fetched {retrieved} and may be cached for six hours. "
+                           f"This community source can lag vacancies or changes; verify official records. {_ref(snapshot, 'P')}")
+        story.append(_p(source_note, "muted"))
+        if political.headquarters_state:
+            story.append(_p(f"Headquarters-state senators: {political.headquarters_state}", "section"))
+            if political.headquarters_senators:
+                rows = [[item.name, item.party, item.start.isoformat()] for item in political.headquarters_senators[:2]]
+                story.append(_table(["US senator", "Party", "Current term began"], rows, [210, 150, 150], small=True))
+            else:
+                story.append(_p("The source did not identify current senators for the reported headquarters state.", "small"))
+            story.append(_p("Headquarters location does not establish a politician's relationship to, support for, or influence over the company; customers and operations may be elsewhere.", "muted"))
+    else:
+        story.append(_note("Current elected-officeholder data were unavailable. Names and party control are not guessed."))
+        story.append(Spacer(1, 8))
+    if analysis.next_election:
+        kind = "presidential" if analysis.next_election.year % 4 == 0 else "congressional midterm"
+        story.append(_p("Next scheduled federal general election", "section"))
+        story.append(_p(f"{analysis.next_election.isoformat()} ({kind}) under the standard US federal calendar: the Tuesday after the first Monday in November. This is not a forecast of candidates or results; primaries and special elections differ. {_ref(snapshot, 'E')}", "body"))
+    story.append(_note("Political affiliation alone does not establish how an issuer will perform. Policy, courts, Congress, central-bank independence and company-specific exposure all matter. The event study on the following pages reports outcomes without asserting causation."))
+
+
+def _policy_page(story: list, snapshot: Snapshot, analysis: Analysis) -> None:
+    _heading(story, 14, "Policy exposure & the company", "How political decisions can reach this business—conditional on its actual operations and customers.")
+    for label, detail in analysis.policy_channels:
+        story.append(_p(label.upper(), "kicker"))
+        story.append(_p(text(detail, 360), "small"))
+    if snapshot.filing and snapshot.filing.policy_excerpts:
+        story.append(_p("Issuer disclosure to verify " + _ref(snapshot, "F"), "section"))
+        story.append(_p('“' + text(snapshot.filing.policy_excerpts[0], 350) + '”', "small"))
+        story.append(_p("This is a selected annual-filing excerpt, not a complete policy-risk review; read the full filing.", "muted"))
+    else:
+        story.append(_p("The available filing search did not establish an issuer-specific policy exposure. Review the company's filings and contracts; an absence of excerpts is not proof of no exposure.", "small"))
+    story.append(_note("These are potential mechanisms, not claims that a particular law will pass or that an elected official favors the company. Party labels and sparse event-window returns are not assigned an arbitrary political score in the six-month model."))
+
+
+def _election_page(story: list, snapshot: Snapshot, analysis: Analysis) -> None:
+    _heading(story, 15, "Stock reactions around elections", "Historical event windows for this ticker, with a broad-market comparison where available.")
+    if analysis.election_reactions:
+        rows = []
+        for event in analysis.election_reactions[:6]:
+            label = text(f"{event.election_type}: {event.outcome}", 58)
+            rows.append([event.election_date.isoformat(), label, event.anchor_date.isoformat(),
+                         pct(event.return_10d, signed=True), pct(event.return_63d, signed=True),
+                         pct(event.return_126d, signed=True), pct(event.benchmark_63d, signed=True)])
+        story.append(_table(["Election", "Type / recorded winner", "Prior close", "+10 days", "+63 days", "+126 days", "SPY +63"],
+                            rows, [64, 120, 64, 65, 65, 65, 67], small=True))
+        story.append(Spacer(1, 10))
+        paired = [event for event in analysis.election_reactions if event.return_63d is not None and event.benchmark_63d is not None]
+        if paired:
+            latest = paired[0]
+            difference = (latest.return_63d - latest.benchmark_63d) * 100
+            story.append(_p(f"For the latest complete matched window (the {latest.anchor_date} close before the {latest.election_date} election through {latest.end_63d}), the ticker's 63-session adjusted-close return was {pct(latest.return_63d, signed=True)} versus {pct(latest.benchmark_63d, signed=True)} for SPY: a {difference:+.1f} percentage-point difference. This is not a causal or beta-adjusted abnormal return.", "body"))
+        else:
+            story.append(_p("A matched SPY comparison was unavailable or not applicable; no benchmark return is assumed.", "body"))
+    else:
+        story.append(_note("No complete or usable election windows were found in the available adjusted-price history. This may reflect a recent listing, missing adjusted closes or unavailable historical data."))
+        story.append(Spacer(1, 8))
+    story.append(_p("How the comparison works", "section"))
+    refs = [_ref(snapshot, 'H'), _ref(snapshot, 'E')]
+    if snapshot.benchmark_prices:
+        refs.append(_ref(snapshot, 'B'))
+    if snapshot.politics:
+        refs.append(_ref(snapshot, 'P'))
+    refs = list(dict.fromkeys(refs))
+    benchmark_note = ("The demo's series labeled SPY is entirely synthetic." if snapshot.demo else
+                      "SPY is a US-dollar ETF proxy, not the index itself, and is compared only when dates match.")
+    story.append(_p(f"The anchor is the last available close before election day; +10, +63 and +126 are subsequent trading sessions (roughly two weeks, three months and six months), not calendar days. Returns use provider-adjusted closes, which account for distributions/splits subject to provider accuracy. {benchmark_note} {' '.join(refs)}", "small"))
+    story.append(_note("Elections coincide with earnings, wars, interest rates, market regimes and many other events. A handful of observations cannot isolate a politician's effect or reliably predict the next election; international listings also have currency and trading-hours differences. These descriptive returns are not used as a political coefficient in the price target."))
 
 def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) -> int:
     """Write the report and return its page count. All external text is escaped."""
@@ -295,7 +446,7 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
     if not negative:
         story.append(_p(analysis.negatives[0], "body"))
     if analysis.target is not None:
-        story.append(_p(f"Our probability-weighted six-month target is {target_display}, or {pct(analysis.expected_return, signed=True)} versus the {snapshot.price_date} close. The bull and bear cases in sections 12 and 13 are alternative outcomes, not optional caveats.", "body"))
+        story.append(_p(f"Our probability-weighted six-month target is {target_display}, or {pct(analysis.expected_return, signed=True)} versus the {snapshot.price_date} close. The bull and bear cases in sections 17 and 18 are alternative outcomes, not optional caveats.", "body"))
     else:
         story.append(_p("A target is deliberately withheld until the minimum company, macro and price-freshness checks are met. See the scorecard and limitations for the missing evidence.", "body"))
 
@@ -407,7 +558,14 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
         ["Shares outstanding", _value(info, "sharesOutstanding", lambda v: compact(v))],
     ]
     story.append(_table(["Measure", "Observation"], rows, [250, 260]))
-    story.append(Spacer(1, 10))
+    cash_rows = [[item.period_end.isoformat(), compact(item.operating_cash_flow, financial_currency),
+                  compact(item.capital_expenditure, financial_currency), compact(item.free_cash_flow, financial_currency)]
+                 for item in snapshot.annuals[:3] if any(v is not None for v in (item.operating_cash_flow, item.capital_expenditure, item.free_cash_flow))]
+    if cash_rows:
+        story.append(_p("Annual cash-flow history " + _ref(snapshot, "S"), "section"))
+        story.append(_table(["Period end", "Operating cash flow", "Capital expenditure", "Free cash flow"], cash_rows, [100, 140, 135, 135], small=True))
+        story.append(_p("Capital expenditure is shown with the provider's reported sign; missing values are not estimated.", "muted"))
+    story.append(Spacer(1, 8))
     story.append(_p(_factor_evidence(snapshot, factors["balance"]), "body"))
     story.append(_p("What changes the thesis", "section"))
     story.append(_p("Positive free cash flow can support investment, debt reduction or distributions; negative free cash flow can require funding. Neither establishes future cash generation. Higher borrowing costs matter most when debt is floating-rate or comes due; maturities and covenants are not provided by this snapshot.", "body"))
@@ -431,12 +589,21 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
     story.append(Spacer(1, 10))
     story.append(_p(_factor_evidence(snapshot, factors["momentum"]), "body"))
     story.append(_p(_factor_evidence(snapshot, factors["analysts"]), "body"))
+    if snapshot.analyst_trend:
+        story.append(_p("Analyst recommendation snapshots " + _ref(snapshot, "A"), "section"))
+        analyst_rows = [[row.period, f"{row.strong_buy} / {row.buy}", str(row.hold), f"{row.sell} / {row.strong_sell}",
+                         pct((row.strong_buy + row.buy) / row.count)] for row in snapshot.analyst_trend[:4]]
+        story.append(_table(["Period", "Strong buy / buy", "Hold", "Sell / strong sell", "Buy share"], analyst_rows, [65, 120, 65, 135, 125], small=True))
+        story.append(_p("0m is the provider's current-month snapshot; -1m, -2m and -3m are earlier snapshots. Coverage may change between periods, so shifts are not necessarily upgrades by the same analysts.", "muted"))
     story.append(_note("The provider's analyst target is a separate outside consensus, typically associated with a longer horizon; verify its date and horizon with the provider. It is not the six-month model target. Averages can hide disagreement, stale estimates and very small samples. " + _ref(snapshot, "A")))
     story.append(Spacer(1, 7))
     story.append(_p("Price returns use daily close-to-close observations on or before the calendar lookback date and exclude dividends. No benchmark outperformance is implied. " + _ref(snapshot, "H"), "small"))
 
-    # 09 / Macro snapshot
-    _heading(story, 9, "The macro backdrop", "US indicators are observed independently; the transmission to this company is assessed next.")
+    _positioning_page(story, snapshot, analysis)
+    _sentiment_page(story, snapshot, analysis)
+
+    # 11 / Macro snapshot
+    _heading(story, 11, "The macro backdrop", "US indicators are observed independently; the transmission to this company is assessed next.")
     macro_rows = []
     for code, label, unit, kind, source_id in SERIES:
         point = snapshot.macro.get(code)
@@ -449,20 +616,24 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
     story.append(_table(["Indicator", "Latest", "~3m change", "As of"], macro_rows, [220, 95, 105, 90], small=True))
     story.append(Spacer(1, 12))
     story.append(_p("How to read the changes", "section"))
-    story.append(_p("Interest rates, unemployment and year-over-year CPI changes are in percentage points (pp); oil and the dollar index changes are percentages. The comparison is the nearest available observation at or before three calendar months earlier. CPI is calculated from the index versus the same month a year earlier. Each series has its own publication lag.", "body"))
+    story.append(_p("Rates, yield/credit spreads, unemployment, CPI inflation and real GDP growth changes are in percentage points (pp); oil, the dollar index and VIX changes are percentages. The comparison is the nearest available observation at or before three calendar months earlier. CPI and real GDP growth are calculated versus the same calendar month/quarter a year earlier. Each series has its own publication lag.", "body"))
     story.append(_p("The US is a global financial reference point, but these indicators are not a complete picture of local conditions or an issuer's geographic revenue mix. An observed macro change is not proof that it caused a stock move.", "body"))
     story.append(_note(_demo_refs(snapshot, factors["macro"].evidence)))
 
     # 10 / Macro channels
-    _heading(story, 10, "How macro reaches this stock", "Transmission mechanisms are conditional; business mix and management actions can change the outcome.")
+    _heading(story, 12, "How macro reaches this stock", "Transmission mechanisms are conditional; business mix and management actions can change the outcome.")
     for label, detail in analysis.macro_channels:
         story.append(_p(label.upper(), "kicker"))
         story.append(_p(text(detail, 430), "body"))
     story.append(Spacer(1, 4))
     story.append(_note("The scored macro overlay uses recent yield, unemployment and inflation changes; oil is also scored only for selected upstream energy or airline industries. The dollar is context only. Sector signs are assumptions, not company-specific statistical estimates. See the model rubric."))
 
-    # 11 / Scenario model
-    _heading(story, 11, "A six-month price framework", "One target, three possible paths. Assumptions are illustrative, not a confidence interval.")
+    _politics_page(story, snapshot, analysis)
+    _policy_page(story, snapshot, analysis)
+    _election_page(story, snapshot, analysis)
+
+    # 16 / Scenario model
+    _heading(story, 16, "A six-month price framework", "One target, three possible paths. Assumptions are illustrative, not a confidence interval.")
     if analysis.scenarios:
         rows = [[s.label, pct(s.probability), pct(s.return_pct, signed=True), price(s.price, currency)] for s in analysis.scenarios]
         story.append(_table(["Scenario", "Assumed weight", "Price change", "6-month price"], rows, [115, 120, 125, 150]))
@@ -482,7 +653,7 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
     story.append(_p("These are price-only scenarios, not total-return forecasts. The model does not predict a path, account for taxes, or guarantee that any outcome will occur.", "small"))
 
     # 12 / Bull case
-    _heading(story, 12, "The bull case", "What has to go right, and which observed facts currently support that path.")
+    _heading(story, 17, "The bull case", "What has to go right, and which observed facts currently support that path.")
     if analysis.scenarios:
         bull = analysis.scenarios[0]
         story.append(_note(f"Illustrative bull scenario: {price(bull.price, currency)} by {analysis.target_date}, or {pct(bull.return_pct, signed=True)} from the anchor close. Assumed scenario weight: {pct(bull.probability)}."))
@@ -498,7 +669,7 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
     story.append(_p("The bull case is a conditional alternative, not a recommendation to buy. Review the opposite case before acting.", "muted"))
 
     # 13 / Bear case
-    _heading(story, 13, "The bear case", "What can go wrong even when the overall score is positive.")
+    _heading(story, 18, "The bear case", "What can go wrong even when the overall score is positive.")
     if analysis.scenarios:
         bear = analysis.scenarios[2]
         story.append(_note(f"Illustrative bear scenario: {price(bear.price, currency)} by {analysis.target_date}, or {pct(bear.return_pct, signed=True)} from the anchor close. Assumed scenario weight: {pct(bear.probability)}.", RED))
@@ -516,7 +687,7 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
     story.append(_p("The downside case is not exhaustive. Litigation, dilution, accounting changes, disruption and geopolitical events may matter even if they are not captured by the numerical model.", "muted"))
 
     # 14 / Monitoring plan
-    _heading(story, 14, "Catalysts & what to monitor", "A practical checklist for the next six months; no event dates are invented.")
+    _heading(story, 19, "Catalysts & what to monitor", "A practical checklist for the next six months; no event dates are invented.")
     growth = number(info.get("revenueGrowth"))
     margin = number(info.get("operatingMargins"))
     rate = snapshot.macro.get("DGS10")
@@ -526,24 +697,19 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
         ["Revenue growth", pct(growth, signed=True), "Check whether growth improves, decelerates or turns negative; investigate customer drivers."],
         ["Operating margin", pct(margin), "Look for pricing power or cost pressure and whether changes are recurring."],
         ["Cash and debt", f"Cash {compact(cash, financial_currency)}; debt {compact(debt, financial_currency)}", "Check maturities, cash generation, refinancing, dividends and dilution."],
-        ["US 10-year yield", _macro_value(rate.value, rate.unit) if rate else "Unavailable", "Compare future yield changes with the rate and funding channels in section 10."],
+        ["US 10-year yield", _macro_value(rate.value, rate.unit) if rate else "Unavailable", "Compare future yield changes with the rate and funding channels in section 12."],
         ["US unemployment", _macro_value(unemp.value, unemp.unit) if unemp else "Unavailable", "Watch for changing demand and credit conditions; check the issuer's actual customer mix."],
     ]
+    if analysis.next_election and snapshot.price_date <= analysis.next_election <= analysis.target_date:
+        watch_rows.append(["US general election", analysis.next_election.isoformat(), "Review the relevant policy channels and avoid assuming an election outcome or price reaction."])
     story.append(_table(["Watch item", "Current reference", "Why it matters"], watch_rows, [115, 150, 245], small=True))
     story.append(Spacer(1, 10))
     story.append(_p(f"Horizon: from the {snapshot.price_date} closing price to {analysis.target_date}. Refresh the source data after each material earnings release or macro surprise; this PDF is a point-in-time snapshot and does not update itself.", "body"))
     story.append(_note("Thresholds in the scorecard are model rules, not trading stops. The absence of an event date, customer name or risk in this report does not establish that none exists."))
-    if snapshot.news:
-        story.append(_p("Recent provider-linked headlines " + _ref(snapshot, "N"), "section"))
-        for item in snapshot.news[:3]:
-            headline = _source_link(text(item.title, 150), item.url)
-            story.append(_rich(f"{headline} — {_esc(item.publisher)}, {_esc(item.published_at)}", "small"))
-        story.append(_p("Headlines are provider-selected, not independently verified, and may not be material; open the original articles for context.", "muted"))
-    else:
-        story.append(_p("Recent headlines were unavailable; check the issuer's filings and current news separately.", "muted"))
+    story.append(_p("Monitor analyst revisions, headline tone, short interest and options positioning as new observations arrive; see sections 8–10 for today's baselines and their limits.", "small"))
 
-    # 15 / Scorecard
-    _heading(story, 15, "Evidence scorecard", "Every contribution is visible. Missing data are excluded, not treated as neutral.")
+    # 20 / Scorecard
+    _heading(story, 20, "Evidence scorecard", "Every contribution is visible. Missing data are excluded, not treated as neutral.")
     score_rows = []
     for factor in analysis.factors:
         score_rows.append([factor.label, pct(factor.weight), _short_factor_score(factor.score), text(_factor_evidence(snapshot, factor), 210)])
@@ -552,10 +718,10 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
     score_text = f"{analysis.score:+.3f}" if analysis.score is not None else "Not available"
     story.append(_note(f"Available weight: {analysis.coverage:.0%}. Normalized score: {score_text}. Sum each available factor's weight × signal, then divide by available weight. Signals range from -1 to +1. A partial score alone is not sufficient to issue a verdict."))
     story.append(Spacer(1, 8))
-    story.append(_p("Verdict rules: bullish at +0.20 or above; bearish at -0.20 or below; otherwise mixed/neutral. The quality gates described in section 16 must also pass. These thresholds are explicit judgment calls, not proof of predictive accuracy.", "small"))
+    story.append(_p("Verdict rules: bullish at +0.20 or above; bearish at -0.20 or below; otherwise mixed/neutral. The quality gates described in section 21 must also pass. These thresholds are explicit judgment calls, not proof of predictive accuracy.", "small"))
 
     # 16 / Reproducibility
-    _heading(story, 16, "Model rules & limitations", "A reproducible heuristic, not a black-box price prediction.")
+    _heading(story, 21, "Model rules & limitations", "A reproducible heuristic, not a black-box price prediction.")
     rules = [
         ["Growth", "Revenue growth: ≥15%, ≥5%, ≥-5%, ≥-15%, otherwise map to +1, +0.5, 0, -0.5, -1."],
         ["Profitability", "Operating margin: ≥20%, ≥10%, ≥0%, ≥-10%, otherwise map to +1, +0.5, 0, -0.5, -1."],
@@ -563,21 +729,23 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
         ["Valuation", "Forward P/E divided by fixed sector anchor: ≤0.75, ≤1.0, ≤1.25, ≤1.75, otherwise map to +1 through -1. Anchors are assumptions, not measured peer multiples."],
         ["Momentum", "Six-month price return: ≥20%, ≥5%, ≥-5%, ≥-20%, otherwise map to +1 through -1. Dividends excluded."],
         ["Analysts", "At least three opinions; apply the growth tier pattern to 3 minus recommendation mean using thresholds 1, 0.5, -0.5, -1 (1 = strong buy; 5 = sell)."],
+        ["Headline tone", "With ≥5 dated, issuer-matched headlines from the last 30 days, multiply mean VADER compound tone by 2, capped at ±1. General-language tone is a noisy, unverified sample—not overall investor sentiment."],
         ["Macro", "Directional sector assumptions applied to ~3-month changes; normalized by 0.5 pp yields, 0.4 pp unemployment, 0.8 pp CPI YoY, and 20% oil (where relevant). Cap each at ±1 and weight by exposure magnitude. At least two recent inputs."],
     ]
     story.append(_table(["Factor", "Calculation"], rules, [105, 405], small=True))
     story.append(Spacer(1, 8))
-    story.append(_p("A verdict and target require an equity, a close at most 14 calendar days old, ≥65% available weight, at least two of growth/profitability/balance/valuation, and a macro signal. Series over 90 days old are not scored. Scenario weights, spread and score-to-return multiplier are judgmental and uncalibrated; see section 11.", "small"))
+    story.append(_p("VADER finance-word lexicon overrides: beat/beats +1.4; upgrade/upgrades +1.6; downgrade/downgrades -1.6; miss/misses -1.2; bankruptcy -2.5; layoffs -1.7; surge +1.2; plunge -1.7.", "small"))
+    story.append(_p("A verdict and target require an equity, a close at most 14 calendar days old, ≥65% available weight, at least two of growth/profitability/balance/valuation, and a macro signal. Series over 90 days old are not scored. Scenario weights, spread and score-to-return multiplier are judgmental and uncalibrated; see section 16.", "small"))
     exposures = EXPOSURES.get(sector)
     if exposures:
         story.append(_p(f"For the {sector} sector the assumed signed sensitivities are {exposures[0]:+.2f} for yields, {exposures[1]:+.2f} for unemployment and {exposures[2]:+.2f} for CPI. Upstream energy and airlines may additionally use oil at +1 or -1 respectively. These are assumptions, not measured correlations.", "small"))
     story.append(_p("Provider financial fields may be stale, incomplete, revised or based on differing periods. No filing, analyst recommendation, customer list, macro correlation or financial value is fabricated when missing.", "muted"))
 
     # 17 / Sources and limitations
-    _heading(story, 17, "Sources & data gaps", "Source dates, audit trail and important boundaries for this point-in-time report.")
+    _heading(story, 22, "Sources & data gaps", "Source dates, audit trail and important boundaries for this point-in-time report.")
     story.append(_p(f"Retrieved: {as_of}. Price anchor: {snapshot.price_date}. Links below open the underlying source pages; data may have changed since retrieval.", "small"))
     if snapshot.demo:
-        story.append(_p("[D] Synthetic local demo dataset. The company, people, customer disclosures, prices, financial figures, analyst opinions, filing excerpts and macro data are entirely fictional; no external sources were queried.", "body"))
+        story.append(_p("[D] Synthetic local demo dataset. The company, people, elected officials, election outcomes, customer disclosures, prices, financial figures, analyst opinions, options, headlines, filing excerpts and macro data are entirely fictional; no external sources were queried.", "body"))
     else:
         ticker_url = quote(snapshot.ticker, safe="")
         sources = [
@@ -585,19 +753,31 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
             ("Q", "Yahoo Finance quote and key statistics", f"https://finance.yahoo.com/quote/{ticker_url}/key-statistics/"),
             ("H", "Yahoo Finance historical prices", f"https://finance.yahoo.com/quote/{ticker_url}/history/"),
             ("A", "Yahoo Finance analyst estimates and recommendations", f"https://finance.yahoo.com/quote/{ticker_url}/analysis/"),
+            ("N", "Yahoo Finance ticker news; eligible individual headlines, if any, are linked in section 10", f"https://finance.yahoo.com/quote/{ticker_url}/news/"),
         ]
         if snapshot.annuals:
             sources.append(("S", "Yahoo Finance annual income statements", f"https://finance.yahoo.com/quote/{ticker_url}/financials/"))
+            sources.append(("S", "Yahoo Finance annual cash-flow statements", f"https://finance.yahoo.com/quote/{ticker_url}/cash-flow/"))
+        if snapshot.benchmark_prices:
+            sources.append(("B", "Yahoo Finance SPY adjusted historical prices", "https://finance.yahoo.com/quote/SPY/history/"))
+        if snapshot.options:
+            sources.append(("O", "Yahoo Finance options chain", f"https://finance.yahoo.com/quote/{ticker_url}/options/"))
+        if snapshot.politics:
+            sources.append(("P", "United States Congress Legislators: executive and congressional terms", snapshot.politics.source_url))
+        sources.extend([
+            ("E", "USA.gov presidential election calendar", "https://www.usa.gov/presidential-election-process"),
+            ("E", "USA.gov congressional and midterm elections", "https://www.usa.gov/midterm-elections"),
+            ("V", "VADER sentiment methodology and thresholds", "https://github.com/cjhutto/vaderSentiment"),
+        ])
         if snapshot.filing:
             sources.append(("F", f"SEC {snapshot.filing.form}, filed {snapshot.filing.filing_date}", snapshot.filing.url))
         for code, label, _unit, _kind, source_id in SERIES:
             point = snapshot.macro.get(code)
-            if point:
-                sources.append((source_id, f"FRED {code}: {label}, observed {point.as_of}", point.source_url))
+            observed = f"observed {point.as_of}" if point else "no usable observation retrieved"
+            url = point.source_url if point else f"https://fred.stlouisfed.org/series/{code}"
+            sources.append((source_id, f"FRED {code}: {label}, {observed}", url))
         for source_id, label, url in sources:
             story.append(_rich(f"<b>[{_esc(source_id)}]</b> {_source_link(label, url)}", "small"))
-        if snapshot.news:
-            story.append(_p("[N] Provider-linked individual news articles are linked directly in section 14.", "small"))
     story.append(_p("Known data gaps & cautions", "section"))
     for limitation in analysis.limitations[:5]:
         story.append(_p("• " + text(limitation, 245), "small"))

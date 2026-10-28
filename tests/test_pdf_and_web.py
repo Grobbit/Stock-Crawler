@@ -19,7 +19,9 @@ def test_demo_pdf_has_structured_sections_disclosures_and_calculation(tmp_path):
     content = "\n".join(page.extract_text() for page in reader.pages)
     for expected in ["SYNTHETIC DEMO", "Northstar Analytics", "The investment decision", "The bull case", "The bear case",
                      "Management & stewardship", "The business & its customers", "macro reaches this stock",
-                     "Annual income statement history", "Model rules & limitations", "Sources & data gaps", "fictional"]:
+                     "Annual income statement history", "Annual cash-flow history", "News tone & sentiment trends",
+                     "Market positioning & risk", "Elections & elected officials", "Policy exposure & the company",
+                     "Stock reactions around elections", "Model rules & limitations", "Sources & data gaps", "fictional"]:
         assert expected in content
     assert "USD " + f"{analysis.target:,.2f}" in content
 
@@ -53,7 +55,9 @@ def test_long_external_fields_do_not_break_page_range(tmp_path):
     snapshot = demo_snapshot()
     snapshot.info["longBusinessSummary"] = "Long company disclosure sentence with useful details. " * 200
     snapshot.info["companyOfficers"] = [{"name": "A" * 100, "title": "C" * 200} for _ in range(12)]
-    snapshot.news = [NewsItem("A recent event " * 30, "Publisher", "2025-01-01", "https://example.com") for _ in range(4)]
+    day = snapshot.fetched_at.date().isoformat()
+    snapshot.news = [NewsItem(f"Northstar headline {i} " + "detailed description " * 7, "Publisher", day,
+                              f"https://example.com/news/{i}") for i in range(20)]
     assert 10 <= create_report(snapshot, analyze(snapshot), tmp_path / "long.pdf") <= 30
 
 
@@ -108,15 +112,24 @@ def test_live_shaped_pdf_keeps_sources_and_caveats(tmp_path):
     snapshot.name = "Test Company"
     snapshot.filing = replace(snapshot.filing, url="https://www.sec.gov/Archives/example.html")
     snapshot.macro = {key: replace(point, source_url=f"https://fred.stlouisfed.org/series/{key}") for key, point in snapshot.macro.items()}
-    snapshot.news = [NewsItem("A test headline", "Example News", "2025-01-01", "https://example.com/news")]
+    snapshot.politics.source_url = "https://github.com/unitedstates/congress-legislators"
+    snapshot.news = [NewsItem("Test Company wins a contract", "Example News", snapshot.fetched_at.date().isoformat(), "https://example.com/news")]
     path = tmp_path / "live-shaped.pdf"
     pages = create_report(snapshot, analyze(snapshot), path)
     assert 10 <= pages <= 30
     reader = PdfReader(path)
     content = "\n".join(p.extract_text() for p in reader.pages)
-    for source in ("[Q]", "[H]", "[A]", "[S]", "[F]", "[M1]", "[M6]", "[N]"):
+    for source in ("[Q]", "[H]", "[A]", "[S]", "[F]", "[M1]", "[M6]", "[M7]", "[M10]", "[N]", "[P]", "[E]", "[V]", "[O]", "[B]"):
         assert source in content
-    assert any(page.get("/Annots") for page in reader.pages)
+    links = []
+    for page in reader.pages:
+        for annotation in page.get("/Annots", []):
+            action = annotation.get_object().get("/A", {})
+            if "/URI" in action:
+                links.append(str(action["/URI"]))
+    assert "https://example.com/news" in links
+    assert "https://github.com/unitedstates/congress-legislators" in links
+    assert "https://fred.stlouisfed.org/series/GDPC1" in links
 
 
 def test_command_line_demo_creates_pdf(tmp_path):
