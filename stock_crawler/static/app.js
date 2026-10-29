@@ -11,6 +11,7 @@
   const result = $('#result-state');
   const progressBar = $('#progress-bar');
   const progressTrack = $('.progress-track');
+  const savedJobKey = 'stockCrawler.recentJob';
   let busy = false;
 
   function showState(state) {
@@ -100,12 +101,54 @@
     const response = await fetch(url, options);
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(typeof payload.detail === 'string' ? payload.detail : 'The request could not be completed. Please try again.');
+      const error = new Error(typeof payload.detail === 'string' ? payload.detail : 'The request could not be completed. Please try again.');
+      error.status = response.status;
+      throw error;
     }
     return payload;
   }
 
-  async function runReport(ticker, demo) {
+  function saveJob(job) {
+    try { sessionStorage.setItem(savedJobKey, JSON.stringify(job)); } catch (_) { /* Optional browser storage. */ }
+  }
+
+  function clearSavedJob() {
+    try { sessionStorage.removeItem(savedJobKey); } catch (_) { /* Optional browser storage. */ }
+  }
+
+  async function followJob(statusUrl) {
+    let transientFailures = 0;
+    while (true) {
+      await delay(1100);
+      let state;
+      try {
+        state = await apiJson(statusUrl);
+        transientFailures = 0;
+      } catch (error) {
+        if (error.status === 404) {
+          clearSavedJob();
+          throw new Error('This report is no longer available. It may have expired or the host may have reset its storage; please start a new report.');
+        }
+        if ([401, 403, 422].includes(error.status)) throw error;
+        if (++transientFailures <= 60) {
+          updateProgress(0, 'Reconnecting to the research service');
+          continue;
+        }
+        throw error;
+      }
+      updateProgress(state.progress, state.stage);
+      if (state.status === 'complete') {
+        showResult(state.result);
+        return;
+      }
+      if (state.status === 'failed') {
+        clearSavedJob();
+        throw new Error(state.error || 'The report could not be generated.');
+      }
+    }
+  }
+
+  async function runReport(ticker, demo, existingUrl = null) {
     if (busy) return;
     clearError();
     if (!/^[A-Z0-9^][A-Z0-9.\-=^]{0,24}$/.test(ticker)) {
@@ -115,38 +158,26 @@
     }
     setBusy(true);
     showState('progress');
-    updateProgress(0, 'Waiting for a research slot');
+    updateProgress(0, existingUrl ? 'Restoring your report' : 'Waiting for a research slot');
     $('#progress-subtitle').textContent = demo ? 'Building a report from fictional sample data.' : `Researching ${ticker} across available sources.`;
     if (window.matchMedia('(max-width: 650px)').matches) {
       $('#output-card').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
     try {
-      const job = await apiJson('/api/reports', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ticker, demo }),
-      });
-      let transientFailures = 0;
-      while (true) {
-        await delay(1100);
-        let state;
-        try {
-          state = await apiJson(job.status_url);
-          transientFailures = 0;
-        } catch (error) {
-          if (++transientFailures < 4) continue;
-          throw error;
-        }
-        updateProgress(state.progress, state.stage);
-        if (state.status === 'complete') {
-          showResult(state.result);
-          break;
-        }
-        if (state.status === 'failed') throw new Error(state.error || 'The report could not be generated.');
+      let statusUrl = existingUrl;
+      if (!statusUrl) {
+        clearSavedJob();
+        const job = await apiJson('/api/reports', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ticker, demo }),
+        });
+        statusUrl = job.status_url;
+        saveJob({ ticker, demo, statusUrl });
       }
+      await followJob(statusUrl);
     } catch (error) {
       showState('preview');
       showError(error.message || 'Could not reach the research service. Please try again.');
-      setBusy(false);
       tickerInput.focus();
     } finally {
       setBusy(false);
@@ -173,11 +204,20 @@
   }));
   $('#start-over').addEventListener('click', () => {
     showState('preview');
+    clearSavedJob();
     tickerInput.value = '';
     clearError();
     tickerInput.focus();
     document.querySelector('#research').scrollIntoView({ behavior: 'smooth', block: 'start' });
   });
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(savedJobKey) || 'null');
+    if (saved && typeof saved.ticker === 'string' && typeof saved.demo === 'boolean' &&
+        /^\/api\/reports\/[0-9a-f-]{36}$/i.test(saved.statusUrl)) {
+      tickerInput.value = saved.ticker;
+      runReport(saved.ticker, saved.demo, saved.statusUrl);
+    }
+  } catch (_) { clearSavedJob(); }
   apiJson('/api/config').then((config) => {
     $('#sec-status').textContent = config.sec_enabled ? 'SEC FILINGS ENABLED' : 'SEC FILINGS OPTIONAL';
     $('#sec-status').title = config.sec_enabled ? 'SEC filing lookup is configured.' : 'Set SEC_USER_AGENT to enable SEC filing lookup.';
