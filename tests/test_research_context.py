@@ -101,7 +101,7 @@ def test_sentiment_filters_date_language_duplicates_and_issuer_relevance():
     assert result.average is not None and result.average > 0
 
 
-def test_sentiment_trend_and_8_percent_factor_affect_target_without_claiming_broad_sentiment():
+def test_sentiment_trend_and_8_percent_factor_affect_ranges_without_claiming_broad_sentiment():
     positive = demo_snapshot()
     today = positive.fetched_at.date()
     positive.news = [news(f"Northstar beats earnings estimates {i}", today - timedelta(days=age))
@@ -114,7 +114,8 @@ def test_sentiment_trend_and_8_percent_factor_affect_target_without_claiming_bro
     factor_down = next(f for f in down.factors if f.key == "headlines")
     assert factor_up.weight == pytest.approx(0.08)
     assert factor_up.score > 0 > factor_down.score
-    assert up.target > down.target
+    assert up.ranges[-1].low > down.ranges[-1].low
+    assert up.ranges[-1].high > down.ranges[-1].high
 
     mixed = deepcopy(positive)
     mixed.news[:3] = negative.news[:3]

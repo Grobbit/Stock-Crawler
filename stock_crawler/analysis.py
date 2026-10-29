@@ -5,11 +5,15 @@ validated forecasting model. Missing inputs are excluded rather than invented.
 """
 from __future__ import annotations
 
+import math
+import statistics
 from datetime import timedelta
 
 from dateutil.relativedelta import relativedelta
 
-from stock_crawler.models import Analysis, Factor, Scenario, Snapshot
+from stock_crawler.backtest import range_log_parameters, realized_volatility, run_backtest, run_recorded_backtest
+from stock_crawler.models import Analysis, Factor, PriceRange, Snapshot
+from stock_crawler.sources.peers import MIN_PEERS
 from stock_crawler.research_context import election_reactions, headline_sentiment, next_general_election, policy_channels, positioning
 from stock_crawler.utils import MINOR_UNIT_CURRENCIES, compact, days_old, number, pct, text
 
@@ -22,12 +26,6 @@ WEIGHTS = {
     "analysts": 0.09,
     "headlines": 0.08,
     "macro": 0.20,
-}
-# Explicit, fixed heuristic anchors, NOT observed sector averages or peer data.
-PE_ANCHORS = {
-    "Technology": 25.0, "Communication Services": 20.0, "Consumer Cyclical": 23.0,
-    "Consumer Defensive": 20.0, "Healthcare": 20.0, "Financial Services": 12.0,
-    "Industrials": 20.0, "Basic Materials": 15.0, "Energy": 12.0, "Utilities": 18.0,
 }
 # Sensitivities are subjective sector-level signs/weights, not regression results.
 # (10-year yield, unemployment, CPI inflation). An increase is the input direction.
@@ -81,12 +79,16 @@ def _return_at(snapshot: Snapshot, months: int) -> float | None:
     if not earlier:
         return None
     point = earlier[-1]
-    if (target - point.date) > timedelta(days=10) or point.close <= 0:
+    old, latest = point.adjusted_close, snapshot.prices[-1].adjusted_close
+    if ((target - point.date) > timedelta(days=10) or old is None or latest is None
+            or not math.isfinite(old) or not math.isfinite(latest) or old <= 0 or latest <= 0):
         return None
-    return snapshot.price / point.close - 1
+    return latest / old - 1
 
 
-def _macro_score(snapshot: Snapshot) -> tuple[float | None, str]:
+def _macro_score(snapshot: Snapshot, macro_override=None, as_of=None) -> tuple[float | None, str]:
+    observations = snapshot.macro if macro_override is None else macro_override
+    reference_day = as_of or snapshot.fetched_at.date()
     sector = text(snapshot.info.get("sector"), 80)
     industry = text(snapshot.info.get("industry"), 100).lower()
     if sector not in EXPOSURES:
@@ -103,8 +105,9 @@ def _macro_score(snapshot: Snapshot) -> tuple[float | None, str]:
     weights = 0.0
     observed: list[str] = []
     for code, exposure, scale in specs:
-        point = snapshot.macro.get(code)
-        if not exposure or not point or point.change_3m is None or days_old(point.as_of, snapshot.fetched_at.date()) > 90:
+        point = observations.get(code)
+        if (not exposure or not point or point.change_3m is None or point.as_of > reference_day
+                or days_old(point.as_of, reference_day) > 90):
             continue
         total += exposure * _clamp(point.change_3m / scale)
         weights += abs(exposure)
@@ -190,18 +193,29 @@ def analyze(snapshot: Snapshot) -> Analysis:
         balance_evidence = "Debt, cash, market value, or matching unambiguous quote/reporting currency units are unavailable; no cross-currency ratio was calculated."
     add("balance", "Balance sheet", balance_score, balance_evidence, "Q")
 
-    anchor = PE_ANCHORS.get(sector)
-    if forward_pe is not None and forward_pe > 0 and anchor and is_equity:
-        ratio = forward_pe / anchor
+    peer_values = []
+    if snapshot.peers and snapshot.peers.industry.casefold() == text(info.get("industry"), 100).casefold():
+        seen_peers: set[str] = set()
+        for peer in snapshot.peers.members:
+            multiple = number(peer.forward_pe)
+            symbol = peer.ticker.upper()
+            if symbol != snapshot.ticker.upper() and symbol not in seen_peers and multiple is not None and multiple > 0:
+                peer_values.append(multiple)
+                seen_peers.add(symbol)
+    if forward_pe is not None and forward_pe > 0 and len(peer_values) >= MIN_PEERS and is_equity and sector != "Real Estate":
+        median = statistics.median(peer_values)
+        ratio = forward_pe / median
         valuation_score = 1.0 if ratio <= 0.75 else 0.5 if ratio <= 1.0 else 0.0 if ratio <= 1.25 else -0.5 if ratio <= 1.75 else -1.0
-        valuation_evidence = f"Forward P/E {forward_pe:.1f}x versus a fixed {anchor:.0f}x {sector} heuristic anchor; the anchor is not an observed peer average."
+        valuation_evidence = (f"Forward P/E {forward_pe:.1f}x versus {median:.1f}x median across {len(peer_values)} "
+                              "provider-listed, same-industry peers with positive forward P/E. This small, changing sample is not a fair-value estimate.")
     else:
         valuation_score = None
-        valuation_evidence = "A positive forward P/E and an applicable sector anchor are required; P/E is not scored for REITs or unknown sectors."
-    add("valuation", "Valuation", valuation_score, valuation_evidence, "Q")
+        valuation_evidence = (f"A positive forward P/E and at least {MIN_PEERS} same-industry peers with positive forward P/E are required; "
+                              "the valuation score is unavailable. Real estate is excluded.")
+    add("valuation", "Valuation", valuation_score, valuation_evidence, "R")
     momentum = returns["6m"]
     add("momentum", "Six-month price trend", _tier(momentum, (0.20, 0.05, -0.05, -0.20)) if momentum is not None else None,
-        f"Six-month price return: {pct(momentum, signed=True)}, excluding dividends; past performance is not a forecast." if momentum is not None else "Six months of comparable daily closes are unavailable.", "H")
+        f"Six-month adjusted-close return: {pct(momentum, signed=True)}, including provider adjustments for distributions/splits; past performance is not a forecast." if momentum is not None else "Six months of comparable adjusted closes are unavailable.", "H")
     if recommendation is not None and 1 <= recommendation <= 5 and analyst_count is not None and analyst_count >= 3:
         analyst_score = _tier(3 - recommendation, (1.0, 0.5, -0.5, -1.0))
         analyst_evidence = f"Provider analyst recommendation mean {recommendation:.2f}/5 from {int(analyst_count)} analysts (1 = strong buy, 5 = sell)."
@@ -237,27 +251,16 @@ def analyze(snapshot: Snapshot) -> Analysis:
     else:
         verdict = "Mixed / neutral"
 
-    target_date = snapshot.price_date + relativedelta(months=6)
-    scenarios: list[Scenario] = []
-    target = expected_return = spread = None
-    spread_basis = "Not applicable while the target is withheld."
-    if enough and score is not None:
-        base_return = 0.16 * score
-        beta = number(info.get("beta"))
-        if beta is not None and 0 < beta <= 5:
-            spread = _clamp(0.20 * beta, 0.12, 0.35)
-            spread_basis = f"20% multiplied by provider beta {beta:.2f}, capped at 12%-35%; beta is a market-sensitivity proxy, not volatility or a confidence interval."
-        else:
-            spread = 0.20
-            spread_basis = "A default 20 percentage-point scenario half-width is used because a suitable beta is unavailable."
-        for label, probability, scenario_return in (
-            ("Bull", 0.25, base_return + spread),
-            ("Base", 0.50, base_return),
-            ("Bear", 0.25, base_return - spread),
-        ):
-            scenarios.append(Scenario(label, probability, scenario_return, snapshot.price * (1 + scenario_return)))
-        target = sum(s.probability * s.price for s in scenarios)
-        expected_return = target / snapshot.price - 1
+    volatility = realized_volatility(snapshot.prices)
+    ranges: list[PriceRange] = []
+    if enough and score is not None and volatility is not None:
+        for months in (1, 3, 6):
+            drift, width = range_log_parameters(score, volatility, months)
+            ranges.append(PriceRange(months, snapshot.price_date + relativedelta(months=months),
+                                     snapshot.price * math.exp(drift - width), snapshot.price * math.exp(drift + width),
+                                     drift, width))
+    backtest = run_backtest(snapshot, _macro_score, _tier, WEIGHTS) if is_equity else None
+    recorded_backtest = run_recorded_backtest(snapshot) if is_equity else None
 
     positive_factors = sorted((f for f in available if f.score is not None and f.score > 0), key=lambda f: f.weight * float(f.score), reverse=True)
     negative_factors = sorted((f for f in available if f.score is not None and f.score < 0), key=lambda f: f.weight * float(f.score))
@@ -272,28 +275,34 @@ def analyze(snapshot: Snapshot) -> Analysis:
 
     limitations = list(snapshot.warnings)
     if not is_equity:
-        limitations.append("The single-company model does not assign a stock verdict or price target to funds, indices, currencies, cryptocurrencies or other non-equity instruments.")
+        limitations.append("The single-company model does not assign a stock verdict or price ranges to funds, indices, currencies, cryptocurrencies or other non-equity instruments.")
     if stale:
-        limitations.append("The latest close is more than 14 calendar days old; the verdict and price target are withheld.")
+        limitations.append("The latest close is more than 14 calendar days old; the verdict and price ranges are withheld.")
     if macro_score is None:
-        limitations.append("The macro overlay lacks at least two recent relevant observations; the verdict and price target are withheld.")
+        limitations.append("The macro overlay lacks at least two recent relevant observations; the verdict and price ranges are withheld.")
     if is_equity and headline_score is None:
         limitations.append("Fewer than five dated, issuer-matched headlines from the past 30 days were available; headline tone is not scored.")
     if fundamental_count < 2:
-        limitations.append("Fewer than two company fundamental factors are available; the verdict and price target are withheld.")
+        limitations.append("Fewer than two company fundamental factors are available; the verdict and price ranges are withheld.")
     if coverage < 0.65 - 1e-9:
-        limitations.append("Available factor weight is below the 65% minimum needed for a verdict and target.")
+        limitations.append("Available factor weight is below the 65% minimum needed for a verdict and price ranges.")
     country = text(info.get("country"), 80)
     if country and country.lower() not in {"united states", "united states of america", "usa", "us"}:
         limitations.append("Macro data are US-centric proxies and do not cover this issuer's local rates, inflation or full geographic mix.")
     if not same_currency and debt is not None and cash is not None:
         limitations.append("Financial-statement and quote currency units differ, are unspecified, or use an ambiguous minor-unit quote; cross-currency balance and yield ratios are not calculated.")
-    limitations.append("This is an uncalibrated, rules-based scenario exercise, not a statistically validated forecast or personalized investment advice.")
+    if enough and volatility is None:
+        limitations.append("At least 64 consecutive usable adjusted closes and nonzero, plausible realized volatility are required; all price ranges are withheld.")
+    if is_equity and not backtest:
+        limitations.append("Insufficient adjusted-price history for a retrospective scorecard-subset test; no hit rate is reported.")
+    limitations.append("The historical test covers only available scorecard factors and does not validate the full verdict. Ranges are uncalibrated scenarios, not confidence intervals or personalized investment advice.")
     # Preserve order while avoiding duplicate caveats.
     limitations = list(dict.fromkeys(limitations))
     limitations.append("Election-window returns are descriptive correlations, not evidence that a politician or election caused a price move; policy channels are conditional.")
-    return Analysis(factors, coverage, score, verdict, target, target_date, expected_return, scenarios, spread, spread_basis,
-                    _macro_channels(snapshot), positives, negatives, limitations, returns, stale,
+    return Analysis(factors=factors, coverage=coverage, score=score, verdict=verdict, ranges=ranges,
+                    realized_volatility=volatility, backtest=backtest, recorded_backtest=recorded_backtest,
+                    macro_channels=_macro_channels(snapshot),
+                    positives=positives, negatives=negatives, limitations=limitations, returns=returns, data_stale=stale,
                     sentiment=sentiment, election_reactions=election_reactions(snapshot),
                     next_election=next_general_election(snapshot.fetched_at.date()), positioning=positioning(snapshot),
                     policy_channels=policy_channels(snapshot))

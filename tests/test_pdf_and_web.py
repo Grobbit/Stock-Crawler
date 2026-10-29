@@ -23,7 +23,9 @@ def test_demo_pdf_has_structured_sections_disclosures_and_calculation(tmp_path):
                      "Market positioning & risk", "Elections & elected officials", "Policy exposure & the company",
                      "Stock reactions around elections", "Model rules & limitations", "Sources & data gaps", "fictional"]:
         assert expected in content
-    assert "USD " + f"{analysis.target:,.2f}" in content
+    assert "USD " + f"{analysis.ranges[-1].low:,.2f}" in content
+    assert "Historical scorecard test" in content
+    assert "not the full live verdict" in content
 
 
 def test_pdf_is_honest_with_missing_or_inapplicable_data(tmp_path):
@@ -45,7 +47,7 @@ def test_pdf_is_honest_with_missing_or_inapplicable_data(tmp_path):
     import re
     content = re.sub(r"\s+", " ", " ".join(p.extract_text() for p in PdfReader(path).pages)).lower()
     assert "insufficient evidence" in content
-    assert "no six-month price target is issued" in content
+    assert "no 1-, 3- or 6-month price ranges are issued" in content
     assert "do not establish named customers" in content
     assert "not supply officer names" in content
     assert "ratios are withheld" in content
@@ -80,6 +82,10 @@ def test_api_demo_job_and_pdf_download(tmp_path, monkeypatch):
     status = client.get(response.json()["status_url"]).json()
     assert status["status"] == "complete"
     assert status["result"]["demo"]
+    assert [item["months"] for item in status["result"]["ranges"]] == [1, 3, 6]
+    assert "subset" in status["result"]["backtest"]["method"].lower()
+    assert status["result"]["recorded_backtest"] is None
+    assert not (tmp_path / "scorecard-history.sqlite3").exists()
     assert status["result"]["pages"] >= 10
     pdf = client.get(status["result"]["pdf_url"])
     assert pdf.status_code == 200
@@ -119,7 +125,7 @@ def test_live_shaped_pdf_keeps_sources_and_caveats(tmp_path):
     assert 10 <= pages <= 30
     reader = PdfReader(path)
     content = "\n".join(p.extract_text() for p in reader.pages)
-    for source in ("[Q]", "[H]", "[A]", "[S]", "[F]", "[M1]", "[M6]", "[M7]", "[M10]", "[N]", "[P]", "[E]", "[V]", "[O]", "[B]"):
+    for source in ("[Q]", "[H]", "[R]", "[A]", "[S]", "[F]", "[M1]", "[M6]", "[M7]", "[M10]", "[N]", "[P]", "[E]", "[V]", "[O]", "[B]"):
         assert source in content
     links = []
     for page in reader.pages:
@@ -141,3 +147,38 @@ def test_command_line_demo_creates_pdf(tmp_path):
     assert result.returncode == 0, result.stderr
     assert path.read_bytes().startswith(b"%PDF")
     assert "DEMO ONLY" in result.stderr
+
+
+def test_archived_full_scorecard_is_separate_from_partial_result_in_pdf(tmp_path):
+    from datetime import timedelta
+    from stock_crawler.models import RecordedSignal
+    snapshot = demo_snapshot()
+    snapshot.recorded_signals = [RecordedSignal(snapshot.fetched_at - timedelta(days=500), 0.8, "Bullish")]
+    analysis = analyze(snapshot)
+    assert any(item.directional_calls for item in analysis.recorded_backtest.horizons)
+    path = tmp_path / "archive.pdf"
+    assert 10 <= create_report(snapshot, analysis, path) <= 30
+    content = " ".join(p.extract_text() for p in PdfReader(path).pages)
+    assert "Separate prospective full-scorecard archive" in content
+    assert "Tested subset" in content
+
+
+def test_stooq_source_is_correctly_cited_without_yahoo_history_link(tmp_path):
+    snapshot = demo_snapshot()
+    snapshot.demo = False
+    snapshot.price_source = "Stooq"
+    snapshot.ticker = "AAPL"
+    snapshot.prices = [replace(point, adjusted_close=None) for point in snapshot.prices]
+    path = tmp_path / "stooq.pdf"
+    create_report(snapshot, analyze(snapshot), path)
+    reader = PdfReader(path)
+    content = " ".join(page.extract_text() for page in reader.pages)
+    assert "Stooq daily prices" in content
+    links = []
+    for page in reader.pages:
+        for annotation in page.get("/Annots", []):
+            action = annotation.get_object().get("/A", {})
+            if "/URI" in action:
+                links.append(str(action["/URI"]))
+    assert any("stooq.com" in link for link in links)
+    assert not any("finance.yahoo.com/quote/AAPL/history" in link for link in links)

@@ -46,7 +46,7 @@ def _same_month(points: list[tuple[date, float]], target: date) -> tuple[date, f
     return matches[-1] if matches else None
 
 
-def parse_series(code: str, label: str, unit: str, kind: str, source_id: str, csv_text: str) -> MacroPoint:
+def parse_observations(code: str, csv_text: str) -> list[tuple[date, float]]:
     points: list[tuple[date, float]] = []
     for row in csv.DictReader(io.StringIO(csv_text)):
         try:
@@ -57,6 +57,11 @@ def parse_series(code: str, label: str, unit: str, kind: str, source_id: str, cs
         if value is not None:
             points.append((observation_date, value))
     points.sort(key=lambda point: point[0])
+    return list({day: value for day, value in points}.items())
+
+
+def point_from_observations(code: str, label: str, unit: str, kind: str, source_id: str,
+                            points: list[tuple[date, float]]) -> MacroPoint:
     if not points:
         raise ValueError("No observations")
     latest_date, latest = points[-1]
@@ -97,7 +102,11 @@ def parse_series(code: str, label: str, unit: str, kind: str, source_id: str, cs
     )
 
 
-def _fetch_one(spec: tuple[str, str, str, str, str]) -> MacroPoint:
+def parse_series(code: str, label: str, unit: str, kind: str, source_id: str, csv_text: str) -> MacroPoint:
+    return point_from_observations(code, label, unit, kind, source_id, parse_observations(code, csv_text))
+
+
+def _fetch_one(spec: tuple[str, str, str, str, str]) -> tuple[MacroPoint, list[tuple[date, float]]]:
     code, label, unit, kind, source_id = spec
     response = requests.get(
         "https://fred.stlouisfed.org/graph/fredgraph.csv",
@@ -106,22 +115,29 @@ def _fetch_one(spec: tuple[str, str, str, str, str]) -> MacroPoint:
         timeout=(5, 15),
     )
     response.raise_for_status()
-    return parse_series(code, label, unit, kind, source_id, response.text)
+    observations = parse_observations(code, response.text)
+    point = point_from_observations(code, label, unit, kind, source_id, observations)
+    # Retain enough history for a ten-year backtest plus a CPI lookback.
+    cutoff = point.as_of - relativedelta(years=13)
+    return point, [(day, value) for day, value in observations if day >= cutoff]
 
 
-def fetch_macro() -> tuple[dict[str, MacroPoint], list[str]]:
+def fetch_macro() -> tuple[dict[str, MacroPoint], dict[str, list[tuple[date, float]]], list[str]]:
     results: dict[str, MacroPoint] = {}
+    history: dict[str, list[tuple[date, float]]] = {}
     failed: list[str] = []
     with ThreadPoolExecutor(max_workers=min(6, len(SERIES)), thread_name_prefix="fred") as executor:
         futures = {executor.submit(_fetch_one, spec): spec for spec in SERIES}
         for future in as_completed(futures):
             spec = futures[future]
             try:
-                point = future.result()
+                point, observations = future.result()
                 results[point.code] = point
+                if point.code in {"DGS10", "UNRATE", "CPIAUCSL", "DCOILWTICO"}:
+                    history[point.code] = observations
             except (requests.RequestException, ValueError, KeyError, OSError):
                 failed.append(spec[0])
     warnings: list[str] = []
     if failed:
         warnings.append("FRED observations unavailable for: " + ", ".join(sorted(failed)) + ".")
-    return results, warnings
+    return results, history, warnings

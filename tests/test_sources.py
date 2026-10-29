@@ -99,7 +99,8 @@ def test_market_history_uses_daily_closes_and_handles_empty_profile(monkeypatch)
             return frame
         def get_info(self): return {}
     monkeypatch.setattr(market.yf, "Ticker", FakeTicker)
-    info, prices, holdings, warnings = market.fetch_market("FAKE")
+    info, prices, holdings, warnings, provider = market.fetch_market("FAKE")
+    assert provider == "Yahoo Finance"
     assert info == {} and holdings == []
     assert [p.close for p in prices] == [100.0, 102.0]
     assert any("profile" in warning for warning in warnings)
@@ -109,7 +110,7 @@ def test_optional_source_failure_does_not_crash_collection(monkeypatch):
     from stock_crawler import collector
     from stock_crawler.demo import demo_snapshot
     sample = demo_snapshot()
-    monkeypatch.setattr(collector, "fetch_market", lambda ticker: (sample.info, sample.prices, [], []))
+    monkeypatch.setattr(collector, "fetch_market", lambda ticker: (sample.info, sample.prices, [], [], "Yahoo Finance"))
     def fail(*args, **kwargs):
         raise RuntimeError("provider internal error")
     monkeypatch.setattr(collector, "fetch_macro", fail)
@@ -120,12 +121,13 @@ def test_optional_source_failure_does_not_crash_collection(monkeypatch):
     monkeypatch.setattr(collector, "fetch_benchmark", fail)
     monkeypatch.setattr(collector, "fetch_options", fail)
     monkeypatch.setattr(collector, "fetch_analyst_trend", fail)
+    monkeypatch.setattr(collector, "fetch_peers", fail)
     snapshot = collector.collect("FAKE")
     assert snapshot.ticker == "FAKE"
     assert snapshot.prices
     assert snapshot.macro == {}
     assert snapshot.filing is None
-    assert len(snapshot.warnings) == 8
+    assert len(snapshot.warnings) == 9
 
 
 def test_cpi_does_not_substitute_a_different_month_for_year_over_year():
