@@ -9,7 +9,7 @@ from stock_crawler.models import PricePoint
 from stock_crawler.utils import normalize_ticker
 
 
-def test_demo_has_consistent_bullish_conclusion_and_target():
+def test_demo_has_consistent_bullish_conclusion_and_ranges():
     snapshot = demo_snapshot()
     analysis = analyze(snapshot)
     assert snapshot.demo
@@ -17,11 +17,9 @@ def test_demo_has_consistent_bullish_conclusion_and_target():
     assert analysis.coverage == pytest.approx(1.0)
     expected_score = sum(f.weight * f.score for f in analysis.factors if f.score is not None) / analysis.coverage
     assert analysis.score == pytest.approx(expected_score)
-    assert sum(s.probability for s in analysis.scenarios) == pytest.approx(1)
-    assert analysis.target == pytest.approx(sum(s.probability * s.price for s in analysis.scenarios))
-    assert analysis.expected_return == pytest.approx(0.16 * analysis.score)
-    assert analysis.scenarios[0].price > analysis.scenarios[1].price > analysis.scenarios[2].price
-    assert analysis.target > snapshot.price
+    assert [item.months for item in analysis.ranges] == [1, 3, 6]
+    assert all(item.low < item.high for item in analysis.ranges)
+    assert (analysis.ranges[-1].low * analysis.ranges[-1].high) ** 0.5 > snapshot.price
 
 
 def test_bearish_data_produces_bearish_conclusion_not_perpetual_hedging():
@@ -35,16 +33,16 @@ def test_bearish_data_produces_bearish_conclusion_not_perpetual_hedging():
     analysis = analyze(snapshot)
     assert analysis.verdict == "Bearish"
     assert analysis.score <= -0.2
-    assert analysis.target < snapshot.price
-    assert analysis.scenarios[0].price > analysis.scenarios[-1].price
+    assert analysis.ranges[-1].low < analysis.ranges[-1].high
+    assert (analysis.ranges[-1].low * analysis.ranges[-1].high) ** 0.5 < snapshot.price
 
 
-def test_missing_macro_or_stale_price_withholds_target():
+def test_missing_macro_or_stale_price_withholds_ranges():
     snapshot = demo_snapshot()
     snapshot.macro = {}
     analysis = analyze(snapshot)
     assert analysis.verdict == "Insufficient evidence"
-    assert analysis.target is None
+    assert not analysis.ranges
     assert any("macro" in note.lower() for note in analysis.limitations)
 
     snapshot = demo_snapshot()
@@ -52,7 +50,7 @@ def test_missing_macro_or_stale_price_withholds_target():
     analysis = analyze(snapshot)
     assert analysis.data_stale
     assert analysis.verdict == "Insufficient evidence"
-    assert analysis.target is None
+    assert not analysis.ranges
 
 
 def test_old_macro_series_and_missing_fundamentals_are_not_imputed():
@@ -60,25 +58,26 @@ def test_old_macro_series_and_missing_fundamentals_are_not_imputed():
     snapshot.macro = {key: replace(point, as_of=point.as_of - timedelta(days=100)) for key, point in snapshot.macro.items()}
     analysis = analyze(snapshot)
     assert next(f for f in analysis.factors if f.key == "macro").score is None
-    assert analysis.target is None
+    assert not analysis.ranges
 
     snapshot = demo_snapshot()
     for key in ("revenueGrowth", "operatingMargins", "totalDebt", "totalCash", "forwardPE"):
         snapshot.info[key] = None
     analysis = analyze(snapshot)
     assert analysis.verdict == "Insufficient evidence"
-    assert analysis.target is None
+    assert not analysis.ranges
     assert analysis.coverage == pytest.approx(WEIGHTS["momentum"] + WEIGHTS["analysts"] + WEIGHTS["headlines"] + WEIGHTS["macro"])
 
 
-def test_macro_inputs_actually_change_model_and_target():
+def test_macro_inputs_actually_change_model_and_ranges():
     snapshot = demo_snapshot()
     stressed = analyze(snapshot)
     snapshot.macro["DGS10"] = replace(snapshot.macro["DGS10"], change_3m=-0.5)
     snapshot.macro["UNRATE"] = replace(snapshot.macro["UNRATE"], change_3m=-0.3)
     eased = analyze(snapshot)
     assert next(f.score for f in eased.factors if f.key == "macro") > next(f.score for f in stressed.factors if f.key == "macro")
-    assert eased.target > stressed.target
+    assert eased.ranges[-1].low > stressed.ranges[-1].low
+    assert eased.ranges[-1].high > stressed.ranges[-1].high
 
 
 def test_quote_currency_units_are_never_silently_mixed():
@@ -96,7 +95,7 @@ def test_funds_do_not_receive_an_equity_model_conclusion():
     snapshot.info["quoteType"] = "ETF"
     analysis = analyze(snapshot)
     assert analysis.verdict == "Insufficient evidence"
-    assert analysis.target is None
+    assert not analysis.ranges
     assert any("funds" in note.lower() for note in analysis.limitations)
 
 
@@ -118,3 +117,13 @@ def test_minor_unit_quotes_do_not_make_an_ambiguous_balance_ratio_even_if_labels
     snapshot.info["financialCurrency"] = "GBp"
     balance = next(f for f in analyze(snapshot).factors if f.key == "balance")
     assert balance.score is None
+
+
+def test_future_dated_macro_observations_are_not_scored():
+    snapshot = demo_snapshot()
+    snapshot.macro = {key: replace(point, as_of=snapshot.fetched_at.date() + timedelta(days=1))
+                      for key, point in snapshot.macro.items()}
+    result = analyze(snapshot)
+    assert next(f.score for f in result.factors if f.key == "macro") is None
+    assert result.verdict == "Insufficient evidence"
+    assert not result.ranges

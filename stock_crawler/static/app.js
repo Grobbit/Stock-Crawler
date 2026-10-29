@@ -63,12 +63,19 @@
     $('#result-ticker').textContent = data.ticker;
     $('#result-company').textContent = data.company;
     $('#result-verdict').textContent = data.verdict;
-    $('#result-target').textContent = formatPrice(data.target, data.currency);
+    const sixMonthTest = data.backtest?.horizons?.find((item) => item.months === 6);
+    $('#result-hit-rate').textContent = sixMonthTest && sixMonthTest.hit_rate !== null
+      ? `${(sixMonthTest.hit_rate * 100).toFixed(0)}% (${sixMonthTest.hits}/${sixMonthTest.calls})`
+      : 'Not available';
+    [1, 3, 6].forEach((months) => {
+      const range = (data.ranges || []).find((item) => item.months === months);
+      $(`#range-${months}`).textContent = range
+        ? `${formatPrice(range.low, data.currency)} – ${formatPrice(range.high, data.currency)}`
+        : 'Withheld';
+    });
     $('#demo-banner').hidden = !data.demo;
-    const change = data.expected_return === null || data.expected_return === undefined
-      ? 'Target withheld until evidence requirements are met.'
-      : `Implied price change: ${data.expected_return >= 0 ? '+' : ''}${(data.expected_return * 100).toFixed(1)}% by ${data.target_date}.`;
-    $('#result-context').textContent = `${data.pages}-page PDF · ${Math.round(data.coverage * 100)}% factor coverage · Last close ${formatPrice(data.last_close, data.currency)} on ${data.price_date}. ${change}`;
+    const testDescription = data.backtest ? `${data.backtest.method} test only; not the full scorecard.` : 'Historical test unavailable.';
+    $('#result-context').textContent = `${data.pages}-page PDF · ${Math.round(data.coverage * 100)}% factor coverage · Last close ${formatPrice(data.last_close, data.currency)} on ${data.price_date}. ${testDescription} Ranges are illustrative, not confidence intervals.`;
     $('#open-pdf').href = data.pdf_url;
     $('#download-pdf').href = `${data.pdf_url}?download=true`;
     const list = $('#warning-list');
@@ -160,7 +167,10 @@
       tickerInput.focus();
     });
   });
-  sampleButtons.forEach((button) => button.addEventListener('click', () => runReport('DEMO', true)));
+  sampleButtons.forEach((button) => button.addEventListener('click', () => {
+    tickerInput.value = 'DEMO';
+    runReport('DEMO', true);
+  }));
   $('#start-over').addEventListener('click', () => {
     showState('preview');
     tickerInput.value = '';

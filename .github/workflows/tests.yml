@@ -16,6 +16,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install -r requirements-dev.txt
-      - run: python -m pytest -q
-      - run: python -m stock_crawler report --demo --output reports/sample.pdf
+      - run: python -m pip install uv==0.13.6
+      - run: uv sync --locked --extra dev
+      - run: uv run --locked --extra dev python -m pytest -q
+      - run: uv run --locked --extra dev ruff check stock_crawler tests --select F,E9
+      - run: node --check stock_crawler/static/app.js
+      - run: uv run --locked --extra dev python -m stock_crawler report --demo --output reports/sample.pdf

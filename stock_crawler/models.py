@@ -64,6 +64,22 @@ class NewsItem:
 
 
 @dataclass(frozen=True)
+class PeerValuation:
+    ticker: str
+    name: str
+    industry: str
+    forward_pe: float
+
+
+@dataclass(frozen=True)
+class PeerGroup:
+    industry_key: str
+    industry: str
+    members: tuple[PeerValuation, ...]
+    retrieved_at: datetime
+
+
+@dataclass(frozen=True)
 class AnalystPeriod:
     period: str
     strong_buy: int
@@ -145,6 +161,13 @@ class ElectionReaction:
     end_63d: date | None
 
 
+@dataclass(frozen=True)
+class RecordedSignal:
+    observed_at: datetime
+    score: float
+    verdict: str
+
+
 @dataclass
 class Snapshot:
     requested_ticker: str
@@ -154,6 +177,11 @@ class Snapshot:
     prices: list[PricePoint]
     macro: dict[str, MacroPoint]
     fetched_at: datetime
+    # The price provider is tracked separately from Yahoo profile/financial sources.
+    price_source: str = "Yahoo Finance"
+    macro_history: dict[str, list[tuple[date, float]]] = field(default_factory=dict)
+    peers: PeerGroup | None = None
+    recorded_signals: list[RecordedSignal] = field(default_factory=list)
     filing: Filing | None = None
     holdings: list[tuple[str, str, float | None]] = field(default_factory=list)
     annuals: list[AnnualFinancial] = field(default_factory=list)
@@ -193,11 +221,44 @@ class Factor:
 
 
 @dataclass(frozen=True)
-class Scenario:
-    label: str
-    probability: float
-    return_pct: float  # fraction, not percentage points
-    price: float
+class PriceRange:
+    months: int
+    end_date: date
+    low: float
+    high: float
+    log_drift: float
+    log_half_width: float
+
+
+@dataclass(frozen=True)
+class BacktestHorizon:
+    months: int
+    directional_calls: int
+    correct_calls: int
+    always_up_correct: int
+    bullish_calls: int
+    bearish_calls: int
+    flat_outcomes: int
+    range_observations: int
+    range_hits: int
+    first_anchor: date | None
+    last_anchor: date | None
+
+    @property
+    def hit_rate(self) -> float | None:
+        return self.correct_calls / self.directional_calls if self.directional_calls else None
+
+    @property
+    def always_up_rate(self) -> float | None:
+        return self.always_up_correct / self.directional_calls if self.directional_calls else None
+
+
+@dataclass(frozen=True)
+class BacktestResult:
+    method: str
+    factors: tuple[str, ...]
+    horizons: tuple[BacktestHorizon, ...]
+    notes: tuple[str, ...]
 
 
 @dataclass
@@ -206,12 +267,10 @@ class Analysis:
     coverage: float
     score: float | None
     verdict: str
-    target: float | None
-    target_date: date
-    expected_return: float | None
-    scenarios: list[Scenario]
-    spread: float | None
-    spread_basis: str
+    ranges: list[PriceRange]
+    realized_volatility: float | None
+    backtest: BacktestResult | None
+    recorded_backtest: BacktestResult | None
     macro_channels: list[tuple[str, str]]
     positives: list[str]
     negatives: list[str]

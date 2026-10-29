@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from stock_crawler import __version__
 from stock_crawler.analysis import analyze
+from stock_crawler.archive import record_signal
 from stock_crawler.collector import collect
 from stock_crawler.report import create_report
 from stock_crawler.sources.market import MarketDataError
@@ -76,16 +77,29 @@ class JobManager:
             self._update(job_id, status="running", progress=3, stage="Starting research")
             snapshot = collect(ticker, demo=demo, progress=lambda p, stage: self._update(job_id, progress=p, stage=stage))
             analysis = analyze(snapshot)
-            self._update(job_id, progress=78, stage="Building the investment thesis and scenarios")
+            self._update(job_id, progress=78, stage="Connecting the thesis, historical test and price ranges")
             pages = create_report(snapshot, analysis, temporary)
             self._update(job_id, progress=96, stage="Finalizing your PDF")
             os.replace(temporary, destination)
+            analysis.limitations.extend(record_signal(snapshot, analysis))
             result = {
                 "ticker": snapshot.ticker, "company": snapshot.name, "currency": snapshot.currency,
                 "verdict": analysis.verdict, "score": analysis.score, "coverage": analysis.coverage,
                 "last_close": snapshot.price, "price_date": snapshot.price_date.isoformat(),
-                "target": analysis.target, "target_date": analysis.target_date.isoformat(),
-                "expected_return": analysis.expected_return, "pages": pages,
+                "ranges": [{"months": item.months, "end_date": item.end_date.isoformat(), "low": item.low, "high": item.high}
+                           for item in analysis.ranges],
+                "backtest": ({"method": analysis.backtest.method,
+                              "horizons": [{"months": item.months, "calls": item.directional_calls,
+                                            "hits": item.correct_calls, "hit_rate": item.hit_rate,
+                                            "always_up_rate": item.always_up_rate}
+                                           for item in analysis.backtest.horizons]} if analysis.backtest else None),
+                "recorded_backtest": ({"method": analysis.recorded_backtest.method,
+                                       "horizons": [{"months": item.months, "calls": item.directional_calls,
+                                                     "hits": item.correct_calls, "hit_rate": item.hit_rate,
+                                                     "always_up_rate": item.always_up_rate}
+                                                    for item in analysis.recorded_backtest.horizons]}
+                                      if analysis.recorded_backtest else None),
+                "pages": pages,
                 "warnings": analysis.limitations, "demo": snapshot.demo,
                 "pdf_url": f"/api/reports/{job_id}/pdf",
             }

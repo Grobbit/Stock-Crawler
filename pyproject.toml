@@ -1,0 +1,28 @@
+[project]
+name = "stock-crawler"
+version = "1.1.0"
+description = "Sourced, reproducible stock research reports"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn[standard]>=0.30,<1.0",
+  "yfinance>=0.2.54,<1.0",
+  "requests>=2.32,<3.0",
+  "beautifulsoup4>=4.12,<5.0",
+  "reportlab>=4.2,<5.0",
+  "python-dateutil>=2.9,<3.0",
+  "PyYAML>=6.0,<7.0",
+  "vaderSentiment>=3.3.2,<4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.27,<1.0",
+  "pytest>=8.0,<10.0",
+  "pypdf>=5.0,<7.0",
+  "ruff>=0.8,<1.0",
+]
+
+[tool.uv]
+package = false

@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 import yfinance as yf
 
 from stock_crawler.models import AnalystPeriod, AnnualFinancial, NewsItem, OptionsSnapshot, PricePoint
+from stock_crawler.sources.stooq import fetch_stooq_prices
 from stock_crawler.utils import number, text
 
 
@@ -33,7 +34,14 @@ def _history(instrument, period: str):
     return instrument.history(period=period, interval="1d", auto_adjust=False, timeout=12, raise_errors=True)
 
 
-def fetch_market(ticker: str) -> tuple[dict[str, Any], list[PricePoint], list[tuple[str, str, float | None]], list[str]]:
+def _completed_utc_days(prices: list[PricePoint]) -> list[PricePoint]:
+    # Daily Yahoo bars for the current session can be intraday, not a final
+    # close. A conservative UTC-day cutoff avoids labeling them as final.
+    today = datetime.now(timezone.utc).date()
+    return [point for point in prices if point.date < today]
+
+
+def fetch_market(ticker: str) -> tuple[dict[str, Any], list[PricePoint], list[tuple[str, str, float | None]], list[str], str]:
     warnings: list[str] = []
     instrument = yf.Ticker(ticker)
     prices: list[PricePoint] = []
@@ -42,17 +50,32 @@ def fetch_market(ticker: str) -> tuple[dict[str, Any], list[PricePoint], list[tu
     # long enough. If the provider can't supply it, retain a one-year fallback.
     for period in ("10y", "1y"):
         try:
-            prices = _prices_from_frame(_history(instrument, period))
+            raw_prices = _prices_from_frame(_history(instrument, period))
+            prices = _completed_utc_days(raw_prices)
             if prices:
+                if len(prices) < len(raw_prices):
+                    warnings.append("Current or future UTC-date price bars were excluded because they may not be final daily closes.")
                 if period == "1y":
                     warnings.append("Only a one-year history was available; election-event analysis will be limited.")
                 break
         except Exception as exc:
             last_error = exc
+    price_source = "Yahoo Finance"
     if not prices:
-        raise MarketDataError(
-            f"Could not retrieve usable price history for {ticker}. Check the Yahoo Finance symbol and network access, or try again if the provider is rate-limiting requests."
-        ) from last_error
+        try:
+            raw_prices = fetch_stooq_prices(ticker)
+            prices = _completed_utc_days(raw_prices)
+            if len(prices) < len(raw_prices) and prices:
+                warnings.append("Current or future UTC-date price bars were excluded because they may not be final daily closes.")
+        except Exception:
+            prices = []
+        if prices:
+            price_source = "Stooq"
+            warnings.append("Yahoo price history was unavailable; a limited Stooq US-symbol fallback is shown. Verify symbol mapping and price adjustments. Separately adjusted closes are unavailable, so volatility ranges and historical adjusted-return tests are withheld.")
+        else:
+            raise MarketDataError(
+                f"Could not retrieve usable price history for {ticker} from Yahoo Finance or the limited Stooq fallback. Check the symbol, network access and provider availability."
+            ) from last_error
     try:
         info = instrument.get_info() or {}
         if not isinstance(info, dict):
@@ -61,6 +84,11 @@ def fetch_market(ticker: str) -> tuple[dict[str, Any], list[PricePoint], list[tu
         info = {}
     if not info:
         warnings.append("The Yahoo Finance company profile and statistics were unavailable; price history alone cannot support a full conclusion.")
+    if price_source == "Stooq" and info.get("currency") and str(info["currency"]).upper() != "USD":
+        raise MarketDataError("The Stooq US fallback cannot be safely matched to this non-USD Yahoo listing; verify the symbol.")
+    quote_type = str(info.get("quoteType") or "").upper()
+    if price_source == "Stooq" and quote_type and quote_type not in {"EQUITY", "ETF", "MUTUALFUND"}:
+        raise MarketDataError("The Stooq US fallback cannot be safely matched to this Yahoo instrument type; verify the symbol.")
 
     holdings: list[tuple[str, str, float | None]] = []
     if str(info.get("quoteType", "")).upper() in {"ETF", "MUTUALFUND"}:
@@ -76,13 +104,13 @@ def fetch_market(ticker: str) -> tuple[dict[str, Any], list[PricePoint], list[tu
             warnings.append("Fund holdings were not available from the market-data provider.")
     if len(prices) < 100:
         warnings.append("Less than roughly five months of daily price history was available; momentum and historical context may be limited.")
-    return info, prices, holdings, warnings
+    return info, prices, holdings, warnings, price_source
 
 
 def fetch_benchmark() -> tuple[list[PricePoint], list[str]]:
     """SPY's adjusted-close series, used for aligned US election comparisons."""
     try:
-        prices = _prices_from_frame(_history(yf.Ticker("SPY"), "10y"))
+        prices = _completed_utc_days(_prices_from_frame(_history(yf.Ticker("SPY"), "10y")))
         if not any(point.adjusted_close is not None for point in prices):
             raise ValueError("Adjusted closes unavailable")
         return prices, []

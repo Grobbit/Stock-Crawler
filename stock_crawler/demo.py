@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from dateutil.relativedelta import relativedelta
 
 from stock_crawler.models import (AnalystPeriod, AnnualFinancial, Filing, MacroPoint, NewsItem, Official,
-                                  OptionsSnapshot, PoliticalContext, PricePoint, Snapshot)
+                                  OptionsSnapshot, PeerGroup, PeerValuation, PoliticalContext, PricePoint, Snapshot)
 
 
 def demo_snapshot() -> Snapshot:
@@ -29,6 +29,19 @@ def demo_snapshot() -> Snapshot:
         prices.append(PricePoint(day, close, close, volume))
         market = round(160 + i * 0.09 + 4 * math.sin(i / 40), 2)
         benchmark.append(PricePoint(day, market, market, 40_000_000))
+    # Synthetic historical macro series allow the demo to exercise a rolling
+    # backtest without implying that any of these observations are real.
+    month = (days[0] - relativedelta(years=2)).replace(day=1)
+    monthly = []
+    while month <= today:
+        monthly.append(month)
+        month += relativedelta(months=1)
+    macro_history = {
+        "DGS10": [(day, 3.8 + 0.7 * math.sin(i / 110)) for i, day in enumerate(days)],
+        "DCOILWTICO": [(day, 70 + 12 * math.sin(i / 90)) for i, day in enumerate(days)],
+        "UNRATE": [(day, 4.2 + 0.5 * math.sin(i / 12)) for i, day in enumerate(monthly)],
+        "CPIAUCSL": [(day, 200 * math.exp(i * 0.002 + 0.015 * math.sin(i / 14))) for i, day in enumerate(monthly)],
+    }
     comparison = today - relativedelta(months=3)
     specs = [
         ("DGS10", "US 10-year Treasury yield", 4.25, 0.18, "%", "pp", "M1"),
@@ -142,12 +155,19 @@ def demo_snapshot() -> Snapshot:
         presidential_winners={year: (f"Fictional winner {year}", "Fictional party") for year in range(today.year - 12, today.year + 1) if year % 4 == 0},
         headquarters_state="OR", retrieved_at=datetime.now(timezone.utc), source_url="",
     )
+    peers = PeerGroup("software-infrastructure", "Software - Infrastructure", (
+        PeerValuation("DEMA", "Fictional Atlas Software", "Software - Infrastructure", 18.0),
+        PeerValuation("DEMB", "Fictional Cedar Cloud", "Software - Infrastructure", 22.0),
+        PeerValuation("DEMC", "Fictional Orbit Systems", "Software - Infrastructure", 28.0),
+        PeerValuation("DEMD", "Fictional Pine Data", "Software - Infrastructure", 35.0),
+    ), datetime.now(timezone.utc))
     analysts = [AnalystPeriod("0m", 4, 7, 4, 1, 0), AnalystPeriod("-1m", 4, 6, 5, 1, 0),
                 AnalystPeriod("-2m", 3, 6, 6, 1, 0), AnalystPeriod("-3m", 3, 5, 7, 1, 0)]
     options = OptionsSnapshot(today + timedelta(days=45), 102_000, 76_000, 80, 80, 80, 80, datetime.now(timezone.utc))
     return Snapshot(
         requested_ticker="DEMO", ticker="DEMO", name="Northstar Analytics, Inc.", info=info,
-        prices=prices, macro=macro, fetched_at=datetime.now(timezone.utc), filing=filing, annuals=annuals, news=news,
+        prices=prices, macro=macro, fetched_at=datetime.now(timezone.utc), macro_history=macro_history, peers=peers,
+        filing=filing, annuals=annuals, news=news,
         analyst_trend=analysts, options=options, benchmark_prices=benchmark, politics=politicians,
         warnings=["DEMO ONLY: all companies, people, politicians, prices, financials, news, macro observations and filing excerpts in this report are synthetic."],
         demo=True,
