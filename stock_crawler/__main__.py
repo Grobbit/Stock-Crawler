@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -11,7 +12,8 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     serve = commands.add_parser("serve", help="start the local web application")
     serve.add_argument("--host", default="127.0.0.1", help="listen address (default: 127.0.0.1)")
-    serve.add_argument("--port", default=8000, type=int)
+    serve.add_argument("--port", default=os.getenv("PORT", "8000"), type=int,
+                       help="listen port (default: PORT environment variable, or 8000)")
     report = commands.add_parser("report", help="generate a PDF from the command line")
     report.add_argument("ticker", nargs="?", help="Yahoo Finance symbol, e.g. AAPL or VOD.L")
     report.add_argument("--demo", action="store_true", help="use an entirely fictional, offline dataset")

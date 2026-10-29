@@ -1,0 +1,22 @@
+# A free, public, single-instance prototype. Free Render storage is ephemeral.
+# For an optional shared login, set STOCK_CRAWLER_AUTH_PASSWORD on Render.
+# See README.md before relying on saved reports or scorecard history.
+services:
+  - type: web
+    name: stock-crawler
+    runtime: python
+    plan: free
+    buildCommand: uv sync --locked
+    startCommand: uv run --locked uvicorn stock_crawler.app:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.12"
+      - key: UV_VERSION
+        value: "0.13.6"
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: STOCK_CRAWLER_REPORT_WORKERS
+        value: "1"
+      # The app defaults to 240 accepted reports/hour, 12 active jobs and
+      # seven-day retention. Add environment variables in Render to change them.

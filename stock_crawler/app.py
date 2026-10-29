@@ -1,8 +1,12 @@
-"""Local, single-process web application and asynchronous report jobs."""
+"""Single-process research app with restart-safe, disk-backed report jobs."""
 from __future__ import annotations
 
+import base64
+import binascii
+import hmac
 import logging
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -10,8 +14,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -19,6 +23,7 @@ from stock_crawler import __version__
 from stock_crawler.analysis import analyze
 from stock_crawler.archive import record_signal
 from stock_crawler.collector import collect
+from stock_crawler.job_store import JobStore, QueueFull, RateLimited
 from stock_crawler.report import create_report
 from stock_crawler.sources.market import MarketDataError
 from stock_crawler.sources.sec import _valid_agent
@@ -34,41 +39,88 @@ class ReportRequest(BaseModel):
     demo: bool = False
 
 
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        if minimum <= value <= maximum:
+            return value
+    except ValueError:
+        pass
+    log.warning("Invalid %s; using default %s", name, default)
+    return default
+
+
+def _authorized(header: str, expected_user: str, expected_password: str) -> bool:
+    if len(header) > 4096:
+        return False
+    scheme, separator, encoded = header.partition(" ")
+    if not separator or scheme.lower() != "basic":
+        return False
+    try:
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return False
+    user, separator, password = decoded.partition(":")
+    if not separator:
+        return False
+    # Evaluate both comparisons and use byte strings, which also supports
+    # non-ASCII credentials without compare_digest raising a TypeError.
+    user_matches = hmac.compare_digest(user.encode("utf-8"), expected_user.encode("utf-8"))
+    password_matches = hmac.compare_digest(password.encode("utf-8"), expected_password.encode("utf-8"))
+    return user_matches and password_matches
+
+
 class JobManager:
-    def __init__(self, output_dir: Path, max_workers: int = 2, max_active: int = 6):
+    def __init__(self, output_dir: Path, max_workers: int | None = None, max_active: int | None = None,
+                 hourly_limit: int | None = None, retention_hours: int | None = None):
         self.output_dir = output_dir
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.max_active = max_active
-        self.lock = threading.Lock()
+        max_workers = max_workers if max_workers is not None else _env_int("STOCK_CRAWLER_REPORT_WORKERS", 2, 1, 8)
+        self.max_active = max_active if max_active is not None else _env_int("STOCK_CRAWLER_MAX_ACTIVE_REPORTS", 12, 1, 100)
+        self.hourly_limit = hourly_limit if hourly_limit is not None else _env_int("STOCK_CRAWLER_REPORTS_PER_HOUR", 240, 0, 1000000)
+        retention_hours = retention_hours if retention_hours is not None else _env_int("STOCK_CRAWLER_JOB_RETENTION_HOURS", 168, 1, 8760)
+        self.store = JobStore(output_dir, retention_hours)
+        # If a write fails while a worker is handling an error, retry recording
+        # the terminal state on the next request rather than leaving a ghost job.
+        self.pending_failures: dict[str, dict[str, Any]] = {}
+        self.pending_lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="report")
-        self.jobs: dict[str, dict[str, Any]] = {}
+        # Only one process/instance may own this directory. On startup, rerun
+        # unfinished work; completed jobs and links survive on a persistent disk.
+        for job_id, ticker, demo in self.store.recover():
+            self.executor.submit(self._run, job_id, ticker, demo)
 
     def submit(self, ticker: str, demo: bool) -> str:
-        job_id = str(uuid.uuid4())
-        with self.lock:
-            now = time.time()
-            # Keep completed status in memory for 24 hours. PDF files remain on
-            # disk until the user deletes them; a restart also clears job status.
-            for key in list(self.jobs):
-                job = self.jobs[key]
-                if job["status"] in {"complete", "failed"} and now - job.get("finished", job["created"]) > 86_400:
-                    del self.jobs[key]
-            if sum(j["status"] in {"queued", "running"} for j in self.jobs.values()) >= self.max_active:
-                raise RuntimeError("The research queue is full. Please try again in a moment.")
-            self.jobs[job_id] = {
-                "id": job_id, "ticker": "DEMO" if demo else ticker, "demo": demo,
-                "status": "queued", "progress": 0, "stage": "Waiting for a research slot",
-                "created": now, "result": None, "error": None,
-            }
-        self.executor.submit(self._run, job_id, ticker, demo)
+        self.flush_failures()
+        job_id = self.store.create(ticker, demo, self.max_active, self.hourly_limit)
+        try:
+            self.executor.submit(self._run, job_id, ticker, demo)
+        except RuntimeError:
+            self._fail(job_id, "The research service is restarting. Please try again.")
+            raise
         return job_id
 
     def _update(self, job_id: str, **changes: Any) -> None:
         if changes.get("status") in {"complete", "failed"}:
             changes["finished"] = time.time()
-        with self.lock:
-            if job_id in self.jobs:
-                self.jobs[job_id].update(changes)
+        self.store.update(job_id, **changes)
+
+    def _fail(self, job_id: str, message: str) -> None:
+        changes = {"status": "failed", "stage": "Research could not be completed", "error": message}
+        try:
+            self._update(job_id, **changes)
+        except (sqlite3.Error, OSError):
+            log.exception("Could not persist failed state for report %s; it will be retried", job_id)
+            with self.pending_lock:
+                self.pending_failures[job_id] = changes
+
+    def flush_failures(self) -> None:
+        with self.pending_lock:
+            for job_id, changes in list(self.pending_failures.items()):
+                self._update(job_id, **changes)
+                del self.pending_failures[job_id]
 
     def _run(self, job_id: str, ticker: str, demo: bool) -> None:
         temporary = self.output_dir / f".{job_id}.tmp"
@@ -105,29 +157,57 @@ class JobManager:
             }
             self._update(job_id, status="complete", progress=100, stage="Research complete", result=result)
         except MarketDataError as exc:
-            self._update(job_id, status="failed", stage="Research could not be completed", error=str(exc))
+            self._fail(job_id, str(exc))
         except Exception:
             log.exception("Report job %s failed", job_id)
-            self._update(job_id, status="failed", stage="Research could not be completed",
-                         error="Something went wrong while building the report. Check the server logs and try again.")
+            self._fail(job_id, "Something went wrong while building the report. Check the server logs and try again.")
         finally:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                log.warning("Could not remove temporary file for report %s", job_id, exc_info=True)
 
     def get(self, job_id: str) -> dict[str, Any] | None:
-        with self.lock:
-            job = self.jobs.get(job_id)
-            if not job:
-                return None
-            if job["status"] in {"complete", "failed"} and time.time() - job.get("finished", job["created"]) > 86_400:
-                del self.jobs[job_id]
-                return None
-            # Do not return internal timestamps or mutable references.
-            return {key: (dict(value) if isinstance(value, dict) else value) for key, value in job.items() if key not in {"created", "finished"}}
+        self.flush_failures()
+        return self.store.get(job_id)
+
+    def healthy(self) -> bool:
+        try:
+            self.flush_failures()
+            return self.store.healthy()
+        except (sqlite3.Error, OSError):
+            return False
 
 
 app = FastAPI(title="Stock Crawler", version=__version__)
 manager = JobManager(REPORT_DIR)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.middleware("http")
+async def shared_password_and_headers(request: Request, call_next):
+    # A shared password is optional. Local development and the default Render
+    # Blueprint remain open; Render health checks must always be reachable.
+    password = os.getenv("STOCK_CRAWLER_AUTH_PASSWORD", "")
+    user = os.getenv("STOCK_CRAWLER_AUTH_USER", "researcher")
+    if password and request.url.path != "/api/health" and not _authorized(request.headers.get("authorization", ""), user, password):
+        return JSONResponse({"detail": "Authentication required."}, status_code=401,
+                            headers={"WWW-Authenticate": 'Basic realm="Stock Crawler", charset="UTF-8"',
+                                     "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.exception_handler(OSError)
+@app.exception_handler(sqlite3.Error)
+async def storage_error_handler(request: Request, exc: sqlite3.Error | OSError):
+    log.error("Report job storage failed: %s", type(exc).__name__)
+    return JSONResponse({"detail": "Report storage is unavailable; please try again later."}, status_code=503,
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/", include_in_schema=False)
@@ -143,6 +223,8 @@ def config():
 
 @app.get("/api/health")
 def health():
+    if not manager.healthy():
+        raise HTTPException(status_code=503, detail="Report storage is unavailable.")
     return {"status": "ok"}
 
 
@@ -154,8 +236,13 @@ def start_report(request: ReportRequest):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
         job_id = manager.submit(ticker, request.demo)
+    except RateLimited as exc:
+        raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": str(exc.retry_after)}) from exc
+    except QueueFull as exc:
+        raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "10"}) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=429, detail=str(exc)) from exc
+        log.exception("Could not start report job")
+        raise HTTPException(status_code=503, detail="The research service is restarting. Please try again.") from exc
     return {"id": job_id, "status_url": f"/api/reports/{job_id}"}
 
 

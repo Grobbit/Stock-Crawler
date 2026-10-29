@@ -89,7 +89,7 @@ python -m stock_crawler serve
 
 Open **http://127.0.0.1:8000** on the same computer. Keep the terminal open while using the app. To stop it, press **Ctrl+C** in that terminal. To use a different port, add `--port 8080` and open the corresponding address.
 
-By default the server listens only on your computer. For a container or a development preview that needs a network interface, use `python -m stock_crawler serve --host 0.0.0.0 --port 8000`. **The application has no login or access control; do not expose it directly to the public internet.**
+By default the server listens only on your computer. For a container or a development preview that needs a network interface, use `python -m stock_crawler serve --host 0.0.0.0 --port 8000`. The port defaults to the `PORT` environment variable when present, otherwise `8000`. The app is **public by default** when exposed to the internet; an optional shared password is described in the Render section below.
 
 ## Using the web app, step by step
 
@@ -101,7 +101,7 @@ By default the server listens only on your computer. For a container or a develo
 6. Click **Open research report** to view the PDF in a new tab, or the download icon to save it. Use **Research another ticker** to start over.
 7. For web jobs, a copy is also saved as `reports/<job-id>.pdf` in the project directory. Your browser download uses a descriptive ticker/date filename. `reports/` is intentionally ignored by Git. Set `STOCK_CRAWLER_REPORT_DIR` before startup to change the server's output directory.
 
-Each report is a point-in-time snapshot. Run it again after earnings, major news or meaningful macro changes. The application keeps job status in memory for up to 24 hours; restarting the server loses the status/download link, although the already-created PDF remains in the output directory. The local queue runs up to two reports at once and accepts up to six queued or running jobs.
+Each report is a point-in-time snapshot. Run it again after earnings, major news or meaningful macro changes. Jobs and their PDF links are stored in `reports/report-jobs.sqlite3` and `reports/` for seven days by default. When the browser supports session storage, a refresh in the same tab restores the latest report or progress. Recent unfinished jobs are retried from the beginning after a server restart, so their source data may differ from the interrupted attempt. Links and retries survive a restart **only if the report directory itself survives**; Render's Free plan clears it. The local default runs up to two reports at once and accepts up to 12 queued or running jobs.
 
 ### Which ticker should I enter?
 
@@ -132,6 +132,44 @@ python -m stock_crawler report --demo --output reports/sample.pdf
 ```
 
 On Windows, replace `python` with `.\.venv\Scripts\python.exe` if you did not activate the virtual environment. The CLI prints the saved path and conclusion, and prints data warnings to standard error. It exits nonzero if the symbol, market data, or PDF generation fails. Set `SEC_USER_AGENT` in the terminal first if you want SEC excerpts.
+
+## Deploy to Render
+
+The checked-in `render.yaml` provides a **free, single-instance web service** with the frontend, API and PDF generator together. It starts with the dependency lockfile, binds to Render's `PORT`, and exposes `/api/health` for readiness. The Blueprint deploys a **public** site by default; don't submit private information, and see the optional password below. It creates no paid database or disk. Render's available plans and terms can change; review them in the dashboard before creating a service.
+
+### 1. Create the service
+
+1. Push the Render changes to GitHub and sign in to [Render](https://render.com/). Deploy a branch containing `render.yaml`; merge the pull request first if you want to deploy `main`.
+2. In the Render dashboard, choose **New → Blueprint**, connect the GitHub repository, and select that branch. Render reads the root `render.yaml`. Confirm the `stock-crawler` web service and **Free** plan, then create the Blueprint.
+3. Watch the first build and deploy in Render. When it is live, open the `onrender.com` URL and click **Explore a sample** to confirm the fictional report works. Then try a real ticker and inspect **Data notes & limitations**; external providers may block or rate-limit cloud-server IPs.
+4. Optional: in the service's **Environment** settings add `SEC_USER_AGENT` with your real name or organization and contact email to enable eligible SEC filing excerpts. Without it, filing lookup is skipped. Never put a real secret or personal contact into a committed file.
+5. Subsequent pushes to the configured branch can trigger automatic redeploys. Remember that the default Free service loses local data at redeploy, restart and idle spin-down.
+
+For manual service creation instead of a Blueprint, use **Python 3**, build command `uv sync --locked`, start command `uv run --locked uvicorn stock_crawler.app:app --host 0.0.0.0 --port $PORT --workers 1`, health check path `/api/health`, and environment variables `PYTHON_VERSION=3.12.12`, `UV_VERSION=0.13.6`, `WEB_CONCURRENCY=1`, `STOCK_CRAWLER_REPORT_WORKERS=1`. Render provides `uv` when the root `uv.lock` is present. Use exactly **one web instance and one web process**: the SQLite-backed queue is designed for a single process, not distributed workers.
+
+### 2. Understand storage and free-tier limits
+
+- **Free Render:** The filesystem is ephemeral. Reports, job statuses and the prospective full-scorecard archive disappear on restart, redeploy or spin-down; a resumed browser may need to start a new report. Free web services normally spin down after 15 minutes idle and may take time to wake. Download any PDF you want to keep immediately. The full-scorecard archive needs persistent storage to accumulate meaningful history.
+- **Optional paid disk:** Upgrade the web service to a plan that supports a persistent disk, attach one at `/var/data`, and set `STOCK_CRAWLER_REPORT_DIR=/var/data/reports` in the service environment. The app creates the directory and stores `report-jobs.sqlite3`, PDFs, and `scorecard-history.sqlite3` inside it. If you override `STOCK_CRAWLER_HISTORY_DB`, that path must also be under the disk mount. Persistent disks add cost, are limited to one service instance, and disable zero-downtime deploys. Back up important data; a disk is not a backup.
+- With persistent storage, **completed** job status and PDF links survive a restart for the configured retention period. **Queued or running** jobs are retried from scratch after startup; they may fetch different live data. If storage disappears, recovery is impossible. Expired job records and PDFs are removed on a later lookup, submission or restart; the separate scorecard archive is not removed by job cleanup.
+- This remains a small **single-instance** app. It is not a highly available, horizontally scalable job system. Multiple Uvicorn workers or instances would compete to restart and process the same jobs. A larger deployment needs a shared durable queue, database and object storage.
+
+### 3. Access and generous limits
+
+The Blueprint is open to anyone who knows its URL. The default admission limit is **240 accepted report requests per hour across the entire service**, with up to **12** queued/running jobs and **one** report generated at a time on the Free Blueprint. This is intentionally permissive for light use; it is a global, single-instance safeguard, **not** a per-user limit or DDoS protection. Progress polling, PDF downloads and health checks are not counted. A full queue or exhausted hourly limit returns HTTP 429 with `Retry-After`; invalid or rejected submissions don't count. Once accepted, a job counts even if its research later fails.
+
+Add these environment variables in Render's **Environment** settings and choose **Save and deploy** to override the defaults. The exception is `STOCK_CRAWLER_REPORT_WORKERS`, which is explicitly managed by the Blueprint: change its value in `render.yaml` and push, or remove its entry from the Blueprint before setting it in the dashboard. Blueprint sync can overwrite values it declares, but preserves environment variables omitted from the file.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `STOCK_CRAWLER_REPORTS_PER_HOUR` | `240` | Accepted reports in a rolling hour across the service; `0` disables the cap. |
+| `STOCK_CRAWLER_MAX_ACTIVE_REPORTS` | `12` | Maximum queued plus running jobs. |
+| `STOCK_CRAWLER_REPORT_WORKERS` | `1` in the Blueprint; `2` locally | Concurrent report-generation threads, **not** Uvicorn processes. |
+| `STOCK_CRAWLER_JOB_RETENTION_HOURS` | `168` | Retain finished job status and PDF for seven days; minimum one hour. |
+
+For a private/shared installation, set `STOCK_CRAWLER_AUTH_PASSWORD` to a long, random password in Render's environment settings; optionally set `STOCK_CRAWLER_AUTH_USER` (default `researcher`). The browser prompts for that shared login and protects the website, API, documents and static files; `/api/health` remains public for Render. Set the values only in Render, not Git. Basic authentication must be used over HTTPS, as provided by Render. Remove the password variable to make the service public again. This is a **single shared password**, not individual user accounts, authorization or a complete security system; avoid sensitive data and add stronger access controls for a broader production deployment.
+
+Providers receive requested tickers and may impose rate limits, restrictions or licensing terms; verify that your intended public use is permitted. The app's limits cannot guarantee provider availability. Confirm a real ticker from the deployed instance—the fictional sample and mocked tests do not prove Yahoo, Stooq, FRED or SEC access from Render.
 
 ## Sources, freshness and coverage
 
@@ -251,7 +289,7 @@ For example, download a series from `https://fred.stlouisfed.org/graph/fredgraph
 - **No headline score or trend:** Fewer than five eligible, dated, issuer-matched headlines in the last 30 days leaves the factor unscored; a trend needs three in each time bucket. Check the listed headlines rather than treating missing news as neutral.
 - **No options ratio:** No suitable expiration, a missing contract field, an incomplete chain or zero call open interest prevents a reliable ratio.
 - **Wrong currency or unfamiliar units:** Check the quote and reporting currency in the source. International listings can use a minor unit such as `GBp`. The app does not apply an implicit FX conversion.
-- **Page says queue full:** Wait for an existing report to finish and try again. Restarting the server clears the in-memory queue and job links.
+- **Page says queue full or hourly limit reached:** Wait and retry. The generous limit and queue size are configurable as described in the Render section; status polls and downloads don't use report slots.
 - **Port already in use:** Start with `--port 8080` and visit `http://127.0.0.1:8080` instead.
 - **An old PDF doesn't update:** Reports are snapshots. Generate a new one to fetch the latest available data.
 
@@ -263,6 +301,6 @@ python -m pytest -q
 python -m stock_crawler report --demo --output reports/sample.pdf
 ```
 
-The test suite uses synthetic fixtures and mocked providers, so it does not need live market access. The app exposes an interactive API reference at `/docs` while the server is running. The main endpoints are `POST /api/reports` (`{"ticker":"AAPL","demo":false}`), `GET /api/reports/{id}` for progress and `GET /api/reports/{id}/pdf` for the completed document. The server is a local single-process tool, not a production multi-user deployment.
+The test suite uses synthetic fixtures and mocked providers, so it does not need live market access. The app exposes an interactive API reference at `/docs` while the server is running. The main endpoints are `POST /api/reports` (`{"ticker":"AAPL","demo":false}`), `GET /api/reports/{id}` for progress and `GET /api/reports/{id}/pdf` for the completed document. The server is a single-process tool, not a horizontally scalable or fully isolated multi-user deployment.
 
 The project is licensed under the [MIT License](LICENSE). The UI bundles DM Sans and DM Serif Display separately under the SIL Open Font License; their license files are in `stock_crawler/static/fonts/`.
