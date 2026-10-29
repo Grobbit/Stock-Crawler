@@ -7,7 +7,14 @@ from urllib.parse import urlsplit
 
 import yfinance as yf
 
-from stock_crawler.models import AnalystPeriod, AnnualFinancial, NewsItem, OptionsSnapshot, PricePoint
+from stock_crawler.models import (
+    AnalystPeriod,
+    AnnualFinancial,
+    NewsItem,
+    OptionsSnapshot,
+    PricePoint,
+    QuarterFinancial,
+)
 from stock_crawler.sources.stooq import fetch_stooq_prices
 from stock_crawler.utils import number, text
 
@@ -118,8 +125,34 @@ def fetch_benchmark() -> tuple[list[PricePoint], list[str]]:
         return [], ["SPY adjusted price history was unavailable; election-event benchmark comparisons are omitted."]
 
 
+def _columns_by_date(frame) -> dict[date, Any]:
+    if frame is None or frame.empty:
+        return {}
+    result = {}
+    today = datetime.now(timezone.utc).date()
+    for column in list(frame.columns)[:8]:
+        try:
+            period = column.date() if hasattr(column, "date") else date.fromisoformat(str(column)[:10])
+            if period <= today:
+                result[period] = column
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _statement_cell(frame, column, *labels: str):
+    if frame is None or column is None:
+        return None
+    for label in labels:
+        if label in frame.index:
+            value = number(frame.at[label, column])
+            if value is not None:
+                return value
+    return None
+
+
 def fetch_annual_financials(ticker: str):
-    """Best-effort annual income and cash-flow statements; missing is never zero."""
+    """Provider annual statements; missing fields are never substituted with zero."""
     instrument = yf.Ticker(ticker)
     warnings: list[str] = []
     try:
@@ -130,48 +163,66 @@ def fetch_annual_financials(ticker: str):
         cashflow = instrument.get_cashflow(freq="yearly", pretty=True)
     except Exception:
         cashflow = None
+    try:
+        balance = instrument.get_balance_sheet(freq="yearly", pretty=True)
+    except Exception:
+        balance = None
     if income is None or income.empty:
         warnings.append("Annual income statements were unavailable from the market-data provider.")
     if cashflow is None or cashflow.empty:
         warnings.append("Annual cash-flow statements were unavailable from the market-data provider.")
-
-    def columns_by_date(frame):
-        if frame is None or frame.empty:
-            return {}
-        result = {}
-        for column in list(frame.columns)[:5]:
-            try:
-                period = column.date() if hasattr(column, "date") else date.fromisoformat(str(column)[:10])
-                result[period] = column
-            except (TypeError, ValueError):
-                continue
-        return result
-
-    def cell(frame, column, *labels: str):
-        if frame is None or column is None:
-            return None
-        for label in labels:
-            if label in frame.index:
-                return number(frame.at[label, column])
-        return None
-
-    income_columns = columns_by_date(income)
-    cash_columns = columns_by_date(cashflow)
+    income_columns = _columns_by_date(income)
+    cash_columns = _columns_by_date(cashflow)
+    balance_columns = _columns_by_date(balance)
     rows = []
-    for period in sorted(set(income_columns) | set(cash_columns), reverse=True)[:4]:
-        ic, cc = income_columns.get(period), cash_columns.get(period)
+    for period in sorted(set(income_columns) | set(cash_columns) | set(balance_columns), reverse=True)[:4]:
+        ic, cc, bc = income_columns.get(period), cash_columns.get(period), balance_columns.get(period)
         item = AnnualFinancial(
-            period, cell(income, ic, "Total Revenue", "TotalRevenue"),
-            cell(income, ic, "Operating Income", "OperatingIncome"),
-            cell(income, ic, "Net Income", "NetIncome"),
-            cell(cashflow, cc, "Operating Cash Flow", "OperatingCashFlow"),
-            cell(cashflow, cc, "Capital Expenditure", "CapitalExpenditure"),
-            cell(cashflow, cc, "Free Cash Flow", "FreeCashFlow"),
+            period, _statement_cell(income, ic, "Total Revenue", "TotalRevenue"),
+            _statement_cell(income, ic, "Operating Income", "OperatingIncome"),
+            _statement_cell(income, ic, "Net Income", "NetIncome"),
+            _statement_cell(cashflow, cc, "Operating Cash Flow", "OperatingCashFlow"),
+            _statement_cell(cashflow, cc, "Capital Expenditure", "CapitalExpenditure"),
+            _statement_cell(cashflow, cc, "Free Cash Flow", "FreeCashFlow"),
+            gross_profit=_statement_cell(income, ic, "Gross Profit", "GrossProfit"),
+            stock_compensation=_statement_cell(cashflow, cc, "Stock Based Compensation", "StockBasedCompensation"),
+            diluted_shares=_statement_cell(income, ic, "Diluted Average Shares", "DilutedAverageShares"),
+            cash=_statement_cell(balance, bc, "Cash And Cash Equivalents", "CashAndCashEquivalents"),
+            total_debt=_statement_cell(balance, bc, "Total Debt", "TotalDebt"),
+            current_assets=_statement_cell(balance, bc, "Current Assets", "CurrentAssets"),
+            current_liabilities=_statement_cell(balance, bc, "Current Liabilities", "CurrentLiabilities"),
+            revenue_concept="Yahoo Total Revenue", operating_concept="Yahoo Operating Income",
         )
         if any(v is not None for v in (item.revenue, item.operating_income, item.net_income,
-                                        item.operating_cash_flow, item.capital_expenditure, item.free_cash_flow)):
+                                       item.operating_cash_flow, item.capital_expenditure, item.free_cash_flow,
+                                       item.cash, item.total_debt)):
             rows.append(item)
     return rows, warnings
+
+
+def fetch_quarterly_financials(ticker: str) -> tuple[list[QuarterFinancial], list[str]]:
+    """A bounded provider quarterly income history, without guessing missing quarters."""
+    try:
+        frame = yf.Ticker(ticker).get_income_stmt(freq="quarterly", pretty=True)
+        columns = _columns_by_date(frame)
+        rows = []
+        for period in sorted(columns, reverse=True)[:6]:
+            col = columns[period]
+            row = QuarterFinancial(
+                period,
+                revenue=_statement_cell(frame, col, "Total Revenue", "TotalRevenue"),
+                gross_profit=_statement_cell(frame, col, "Gross Profit", "GrossProfit"),
+                operating_income=_statement_cell(frame, col, "Operating Income", "OperatingIncome"),
+                net_income=_statement_cell(frame, col, "Net Income", "NetIncome"),
+                diluted_eps=_statement_cell(frame, col, "Diluted EPS", "DilutedEPS"),
+                diluted_shares=_statement_cell(frame, col, "Diluted Average Shares", "DilutedAverageShares"),
+                revenue_concept="Yahoo Total Revenue", operating_concept="Yahoo Operating Income",
+            )
+            if any(v is not None for v in (row.revenue, row.gross_profit, row.operating_income, row.net_income)):
+                rows.append(row)
+        return rows, [] if rows else ["Quarterly income statements were unavailable from the market-data provider."]
+    except Exception:
+        return [], ["Quarterly income statements were unavailable from the market-data provider."]
 
 
 def fetch_news(ticker: str):

@@ -6,8 +6,26 @@ from datetime import date, datetime, timedelta, timezone
 
 from dateutil.relativedelta import relativedelta
 
-from stock_crawler.models import (AnalystPeriod, AnnualFinancial, Filing, MacroPoint, NewsItem, Official,
-                                  OptionsSnapshot, PeerGroup, PeerValuation, PoliticalContext, PricePoint, Snapshot)
+from stock_crawler.models import (
+    AnalystPeriod,
+    AnnualFinancial,
+    CompanyProfile,
+    Filing,
+    FilingEvent,
+    MacroPoint,
+    NewsItem,
+    Official,
+    OptionsSnapshot,
+    PeerGroup,
+    PeerValuation,
+    PoliticalContext,
+    PricePoint,
+    QuarterFinancial,
+    RevenueBreakdown,
+    RevenueComponent,
+    Snapshot,
+    WebResult,
+)
 
 
 def demo_snapshot() -> Snapshot:
@@ -129,11 +147,28 @@ def demo_snapshot() -> Snapshot:
             "In this fictional example, a service interruption or cybersecurity incident could damage customer relationships and increase costs.",
         ),
         policy_excerpts=("In this fictional example, government contracts and data regulations may influence public-sector demand and compliance costs.",),
+        operating_excerpts=("In this fictional example, subscription sales increased as existing customers adopted more planning products, while implementation costs reduced the operating margin.",),
+        revenue_breakdowns=(RevenueBreakdown("Products and services", date(today.year - 1, 1, 1), date(today.year - 1, 12, 31), "USD", 2_040_000_000,
+                             (RevenueComponent("Cloud subscriptions", 1_500_000_000, "demo:CloudSubscriptionsMember", 1_230_000_000),
+                              RevenueComponent("Services and support", 540_000_000, "demo:ServicesMember", 490_000_000)), "demo:Revenue",
+                             date(today.year - 2, 1, 1), date(today.year - 2, 12, 31), 1_720_000_000),),
+        recent_events=(FilingEvent("SIMULATED 8-K", today - timedelta(days=20), today - timedelta(days=22), "", ("2.02",)),),
     )
     annuals = [
-        AnnualFinancial(date(today.year - 1, 12, 31), 2_040_000_000, 440_000_000, 345_000_000, 510_000_000, -120_000_000, 390_000_000),
-        AnnualFinancial(date(today.year - 2, 12, 31), 1_720_000_000, 325_000_000, 240_000_000, 380_000_000, -105_000_000, 275_000_000),
+        AnnualFinancial(date(today.year - 1, 12, 31), 2_040_000_000, 440_000_000, 345_000_000, 510_000_000, -120_000_000, 390_000_000,
+                        gross_profit=1_468_800_000, stock_compensation=95_000_000, diluted_shares=110_000_000,
+                        cash=1_500_000_000, total_debt=900_000_000, current_assets=1_800_000_000, current_liabilities=900_000_000),
+        AnnualFinancial(date(today.year - 2, 12, 31), 1_720_000_000, 325_000_000, 240_000_000, 380_000_000, -105_000_000, 275_000_000,
+                        gross_profit=1_190_000_000, stock_compensation=75_000_000, diluted_shares=106_000_000),
         AnnualFinancial(date(today.year - 3, 12, 31), 1_390_000_000, 205_000_000, 150_000_000, 250_000_000, -90_000_000, 160_000_000),
+    ]
+    quarter_end = today - relativedelta(months=1)
+    quarters = [
+        QuarterFinancial(quarter_end, 600_000_000, 432_000_000, 144_000_000, 104_000_000, 0.95, 110_000_000),
+        QuarterFinancial(quarter_end - relativedelta(months=3), 570_000_000, 410_000_000, 137_000_000, 97_000_000, 0.89, 109_000_000),
+        QuarterFinancial(quarter_end - relativedelta(months=6), 550_000_000, 395_000_000, 128_000_000, 90_000_000, 0.83, 108_000_000),
+        QuarterFinancial(quarter_end - relativedelta(months=9), 530_000_000, 380_000_000, 120_000_000, 82_000_000, 0.76, 108_000_000),
+        QuarterFinancial(quarter_end - relativedelta(months=12), 500_000_000, 360_000_000, 125_000_000, 80_000_000, 0.75, 106_000_000),
     ]
     headlines = [
         (1, "Fictional Northstar beats earnings expectations"),
@@ -156,10 +191,10 @@ def demo_snapshot() -> Snapshot:
         headquarters_state="OR", retrieved_at=datetime.now(timezone.utc), source_url="",
     )
     peers = PeerGroup("software-infrastructure", "Software - Infrastructure", (
-        PeerValuation("DEMA", "Fictional Atlas Software", "Software - Infrastructure", 18.0),
-        PeerValuation("DEMB", "Fictional Cedar Cloud", "Software - Infrastructure", 22.0),
-        PeerValuation("DEMC", "Fictional Orbit Systems", "Software - Infrastructure", 28.0),
-        PeerValuation("DEMD", "Fictional Pine Data", "Software - Infrastructure", 35.0),
+        PeerValuation("DEMA", "Fictional Atlas Software", "Software - Infrastructure", 18.0, 0.12, 0.17),
+        PeerValuation("DEMB", "Fictional Cedar Cloud", "Software - Infrastructure", 22.0, 0.14, 0.20),
+        PeerValuation("DEMC", "Fictional Orbit Systems", "Software - Infrastructure", 28.0, 0.20, 0.22),
+        PeerValuation("DEMD", "Fictional Pine Data", "Software - Infrastructure", 35.0, 0.28, 0.25),
     ), datetime.now(timezone.utc))
     analysts = [AnalystPeriod("0m", 4, 7, 4, 1, 0), AnalystPeriod("-1m", 4, 6, 5, 1, 0),
                 AnalystPeriod("-2m", 3, 6, 6, 1, 0), AnalystPeriod("-3m", 3, 5, 7, 1, 0)]
@@ -167,8 +202,14 @@ def demo_snapshot() -> Snapshot:
     return Snapshot(
         requested_ticker="DEMO", ticker="DEMO", name="Northstar Analytics, Inc.", info=info,
         prices=prices, macro=macro, fetched_at=datetime.now(timezone.utc), macro_history=macro_history, peers=peers,
-        filing=filing, annuals=annuals, news=news,
-        analyst_trend=analysts, options=options, benchmark_prices=benchmark, politics=politicians,
+        filing=filing,
+        company_profile=CompanyProfile("Q0", "Fictional Northstar Analytics", ("Cloud planning", "Data analytics"),
+                                       ("Fictional Northstar Services",), ("Fictional founder",), str(today.year - 18), datetime.now(timezone.utc)),
+        annuals=annuals, quarters=quarters, news=news,
+        web_news=[NewsItem("Fictional Northstar expands its cloud planning subscriptions", "Synthetic web news", str(today - timedelta(days=4)), "")],
+        web_results=[WebResult("Fictional Northstar customer contracts", "", "A fictional source discusses subscription contracts and implementation costs.",
+                               "Synthetic source", str(today - timedelta(days=7)), "Customers & strategy", "Synthetic web search")],
+        web_search_enabled=True, analyst_trend=analysts, options=options, benchmark_prices=benchmark, politics=politicians,
         warnings=["DEMO ONLY: all companies, people, politicians, prices, financials, news, macro observations and filing excerpts in this report are synthetic."],
         demo=True,
     )

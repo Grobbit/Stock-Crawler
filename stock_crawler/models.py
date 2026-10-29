@@ -31,6 +31,38 @@ class MacroPoint:
 
 
 @dataclass(frozen=True)
+class RevenueComponent:
+    # Labels are derived from XBRL member names, not invented product names.
+    label: str
+    value: float
+    member: str
+    prior_value: float | None = None
+
+
+@dataclass(frozen=True)
+class RevenueBreakdown:
+    kind: str
+    start: date
+    end: date
+    currency: str
+    total: float
+    components: tuple[RevenueComponent, ...]
+    concept: str
+    prior_start: date | None = None
+    prior_end: date | None = None
+    prior_total: float | None = None
+
+
+@dataclass(frozen=True)
+class FilingEvent:
+    form: str
+    filing_date: date
+    report_date: date | None
+    url: str
+    items: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Filing:
     form: str
     filing_date: date
@@ -40,6 +72,13 @@ class Filing:
     risk_excerpts: tuple[str, ...] = ()
     truncated: bool = False
     policy_excerpts: tuple[str, ...] = ()
+    operating_excerpts: tuple[str, ...] = ()
+    revenue_breakdowns: tuple[RevenueBreakdown, ...] = ()
+    recent_events: tuple[FilingEvent, ...] = ()
+    latest_quarter: Filing | None = None
+    sec_annuals: tuple[AnnualFinancial, ...] = ()
+    sec_quarters: tuple[QuarterFinancial, ...] = ()
+    companyfacts_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -51,6 +90,43 @@ class AnnualFinancial:
     operating_cash_flow: float | None = None
     capital_expenditure: float | None = None
     free_cash_flow: float | None = None
+    gross_profit: float | None = None
+    stock_compensation: float | None = None
+    diluted_shares: float | None = None
+    cash: float | None = None
+    total_debt: float | None = None
+    current_assets: float | None = None
+    current_liabilities: float | None = None
+    source: str = "Yahoo Finance"
+    currency: str = ""
+    revenue_concept: str = ""
+    operating_concept: str = ""
+    period_start: date | None = None
+
+
+@dataclass(frozen=True)
+class QuarterFinancial:
+    period_end: date
+    revenue: float | None = None
+    gross_profit: float | None = None
+    operating_income: float | None = None
+    net_income: float | None = None
+    diluted_eps: float | None = None
+    diluted_shares: float | None = None
+    source: str = "Yahoo Finance"
+    currency: str = ""
+    revenue_concept: str = ""
+    operating_concept: str = ""
+    period_start: date | None = None
+
+
+@dataclass(frozen=True)
+class ResearchInsight:
+    label: str
+    evidence: str
+    implication: str
+    direction: str  # positive, negative or mixed; descriptive, not a forecast
+    source: str
 
 
 @dataclass(frozen=True)
@@ -64,11 +140,35 @@ class NewsItem:
 
 
 @dataclass(frozen=True)
+class CompanyProfile:
+    entity_id: str
+    name: str
+    products: tuple[str, ...] = ()
+    subsidiaries: tuple[str, ...] = ()
+    founders: tuple[str, ...] = ()
+    inception: str = ""
+    retrieved_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class WebResult:
+    title: str
+    url: str
+    snippet: str
+    publisher: str
+    published_at: str
+    topic: str
+    source: str
+
+
+@dataclass(frozen=True)
 class PeerValuation:
     ticker: str
     name: str
     industry: str
     forward_pe: float
+    revenue_growth: float | None = None
+    operating_margin: float | None = None
 
 
 @dataclass(frozen=True)
@@ -183,9 +283,14 @@ class Snapshot:
     peers: PeerGroup | None = None
     recorded_signals: list[RecordedSignal] = field(default_factory=list)
     filing: Filing | None = None
+    company_profile: CompanyProfile | None = None
     holdings: list[tuple[str, str, float | None]] = field(default_factory=list)
     annuals: list[AnnualFinancial] = field(default_factory=list)
+    quarters: list[QuarterFinancial] = field(default_factory=list)
     news: list[NewsItem] = field(default_factory=list)
+    web_news: list[NewsItem] = field(default_factory=list)
+    web_results: list[WebResult] = field(default_factory=list)
+    web_search_enabled: bool = False
     analyst_trend: list[AnalystPeriod] = field(default_factory=list)
     options: OptionsSnapshot | None = None
     benchmark_prices: list[PricePoint] = field(default_factory=list)
@@ -282,3 +387,4 @@ class Analysis:
     next_election: date | None = None
     positioning: dict[str, float | None] = field(default_factory=dict)
     policy_channels: list[tuple[str, str]] = field(default_factory=list)
+    research_insights: list[ResearchInsight] = field(default_factory=list)

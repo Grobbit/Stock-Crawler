@@ -7,19 +7,37 @@ import re
 from pathlib import Path
 from urllib.parse import quote
 
-from dateutil.relativedelta import relativedelta
 import reportlab
+from dateutil.relativedelta import relativedelta
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import Flowable, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import (
+    Flowable,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 from stock_crawler.analysis import EXPOSURES, SECTOR_CHANNELS
+from stock_crawler.financial_research import selected_annuals, selected_quarters
 from stock_crawler.models import Analysis, Factor, Snapshot
 from stock_crawler.sources.fred import SERIES
-from stock_crawler.utils import MINOR_UNIT_CURRENCIES, compact, date_from_timestamp, number, pct, price, text
+from stock_crawler.sources.web_research import news_theme
+from stock_crawler.utils import (
+    MINOR_UNIT_CURRENCIES,
+    compact,
+    date_from_timestamp,
+    number,
+    pct,
+    price,
+    text,
+)
 
 FONT_DIR = os.path.join(reportlab.__path__[0], "fonts")
 pdfmetrics.registerFont(TTFont("Crawler", os.path.join(FONT_DIR, "Vera.ttf")))
@@ -70,7 +88,7 @@ def _ref(snapshot: Snapshot, source: str) -> str:
 
 
 def _demo_refs(snapshot: Snapshot, value: str) -> str:
-    return re.sub(r"\[(?:M\d+|Q|H|A|F|S|N|P|E|B|O|V|R)\]", "[D]", value) if snapshot.demo else value
+    return re.sub(r"\[(?:M\d+|Q|H|A|FQ|F|S|N|G|W|X|K|P|E|B|O|V|R)\]", "[D]", value) if snapshot.demo else value
 
 
 def _factor_evidence(snapshot: Snapshot, factor: Factor) -> str:
@@ -236,6 +254,146 @@ def _source_link(title: str, url: str) -> str:
 def _range_text(item, currency: str) -> str:
     return f"{currency} {item.low:,.2f}–{item.high:,.2f}" if item else "Withheld"
 
+
+
+def _business_evidence_page(story: list, snapshot: Snapshot, analysis: Analysis) -> None:
+    filing, profile = snapshot.filing, snapshot.company_profile
+    filing_details = bool(filing and (filing.revenue_breakdowns or filing.operating_excerpts or
+                                      (filing.latest_quarter and filing.latest_quarter.operating_excerpts)))
+    if not filing_details and not (profile and (profile.products or profile.subsidiaries)):
+        return
+    _heading(story, 3, "Revenue drivers & issuer evidence", "A closer look at where the business earns revenue and what the sources disclose.")
+    order = {"Products and services": 0, "Reported business segments": 1, "Geographic areas": 2}
+    groups = sorted(filing.revenue_breakdowns, key=lambda item: order.get(item.kind, 9))[:2] if filing else []
+    for group in groups:
+        story.append(_p(f"{group.kind} · year ended {group.end} " + _ref(snapshot, "F"), "section"))
+        comparable = bool(group.prior_end and all(part.prior_value is not None and part.prior_value > 0 for part in group.components))
+        rows = []
+        for part in group.components[:4]:
+            row = [part.label, compact(part.value, group.currency), pct(part.value / group.total)]
+            if comparable:
+                row.append(pct(part.value / part.prior_value - 1, signed=True))
+            rows.append(row)
+        if len(group.components) > 4:
+            remainder = group.components[4:]
+            rest = sum(part.value for part in remainder)
+            row = ["Other tagged components", compact(rest, group.currency), pct(rest / group.total)]
+            if comparable:
+                prior_rest = sum(part.prior_value for part in remainder)
+                row.append(pct(rest / prior_rest - 1, signed=True))
+            rows.append(row)
+        if comparable:
+            story.append(_table(["Filing-tagged category", "Revenue", "Share", "YoY change"], rows, [240, 110, 80, 80], small=True))
+            story.append(_p(f"Year-over-year changes compare the fiscal year ended {group.prior_end}; category and accounting definitions may change.", "muted"))
+        else:
+            story.append(_table(["Filing-tagged category", "Revenue", "Share of total"], rows, [260, 140, 110], small=True))
+    mix_change = next((item for item in analysis.research_insights if item.label == "Revenue mix shifts"), None)
+    if mix_change:
+        story.append(_p(mix_change.evidence + " " + _ref(snapshot, mix_change.source), "small"))
+        story.append(_p(mix_change.implication, "muted"))
+    if groups:
+        story.append(_p("Tagged values shown numerically reconcile to consolidated revenue within 0.3%, but reconciliation does not prove the categories are non-overlapping. Names are derived from XBRL tags; verify the original table. Segment, product and geography views are alternatives, not amounts to add together. " + _ref(snapshot, "F"), "muted"))
+    if profile and (profile.products or profile.subsidiaries):
+        details = []
+        if profile.products:
+            details.append("Products listed: " + ", ".join(profile.products[:5]))
+        if profile.subsidiaries:
+            details.append("Listed subsidiaries: " + ", ".join(profile.subsidiaries[:4]))
+        story.append(_p("Independent company context " + _ref(snapshot, "K"), "section"))
+        profile_note = ("These names are fictional; Wikidata was not queried." if snapshot.demo else
+                        "Community-maintained Wikidata may be incomplete or outdated; verify current ownership and product importance in filings.")
+        story.append(_p("; ".join(details) + ". " + profile_note, "small"))
+    excerpts = []
+    if filing and filing.latest_quarter:
+        excerpts.extend((excerpt, filing.latest_quarter, "FQ") for excerpt in filing.latest_quarter.operating_excerpts[:1])
+    if filing:
+        excerpts.extend((excerpt, filing, "F") for excerpt in filing.operating_excerpts[:2])
+    if excerpts:
+        story.append(_p("What management reported", "section"))
+        for excerpt, document, citation in excerpts[:2]:
+            story.append(_p(f"{document.form}, filed {document.filing_date}: “{text(excerpt, 245)}” " + _ref(snapshot, citation), "small"))
+        story.append(_p("Selected fragments are management's statements, not independent verification; read the full filing and tables before relying on them.", "muted"))
+    story.append(_note("A revenue mix shows exposure, not profit by segment or named customer concentration. A major business line's growth, pricing and costs can matter disproportionately, but a mechanism or outcome is not assumed."))
+
+
+def _financial_detail_page(story: list, snapshot: Snapshot, analysis: Analysis) -> None:
+    quarters = selected_quarters(snapshot)
+    useful = [insight for insight in analysis.research_insights if insight.source in {"S", "X"}]
+    if not quarters and not useful:
+        return
+    _heading(story, 6, "Financial trajectory & quality", "Compare like periods, then connect sales, margins, cash generation and per-share ownership.")
+    if quarters:
+        source = "X" if quarters[0].source == "SEC XBRL" else "S"
+        currency = quarters[0].currency or text(snapshot.info.get("financialCurrency"), 12) or "reporting currency"
+        rows = []
+        for item in quarters[:5]:
+            revenue = item.revenue if item.revenue is not None and item.revenue > 0 else None
+            gross = item.gross_profit / revenue if item.gross_profit is not None and revenue else None
+            operating = item.operating_income / revenue if item.operating_income is not None and revenue else None
+            rows.append([item.period_end.isoformat(), compact(item.revenue, currency), pct(gross), pct(operating), compact(item.net_income, currency)])
+        story.append(_p("Quarterly income history " + _ref(snapshot, source), "section"))
+        story.append(_table(["Period end", "Revenue", "Gross margin", "Operating margin", "Net income"], rows, [96, 117, 95, 108, 94], small=True))
+        story.append(_p("SEC rows use reported 65–110-day durations; Yahoo rows use the provider's quarterly statements. Gross and operating margins are profit divided by revenue, not forecast margins. Quarters may be seasonal and can contain nonrecurring items.", "muted"))
+    if useful:
+        story.append(_p("What the changes mean", "section"))
+        for item in useful[:4]:
+            story.append(_p(item.label + ": " + item.evidence + " " + _ref(snapshot, item.source), "small"))
+            story.append(_p(item.implication, "muted"))
+    story.append(_note("These company-specific observations are descriptive and are not added to the existing weighted scorecard. Comparison requires matching source, period and revenue/operating concepts; missing or incompatible figures are withheld."))
+
+
+_EVENT_ITEMS = {
+    "1.01": "Material agreement", "1.02": "Agreement termination", "2.01": "Acquisition or disposition",
+    "2.02": "Results of operations", "2.03": "Direct financial obligation", "2.05": "Exit or disposal costs",
+    "2.06": "Material impairment", "3.01": "Listing notice", "4.01": "Auditor change",
+    "5.02": "Directors or executives", "5.07": "Shareholder vote", "7.01": "Regulation FD disclosure",
+    "8.01": "Other events", "9.01": "Financial statements and exhibits",
+}
+
+
+def _independent_research_page(story: list, snapshot: Snapshot) -> None:
+    events = snapshot.filing.recent_events if snapshot.filing else ()
+    if not (snapshot.web_news or snapshot.web_results or events):
+        return
+    _heading(story, 10, "Independent leads & filing events", "Issuer-specific leads from additional sources, kept separate from the scored headline sample.")
+    if events:
+        story.append(_p("Recent SEC current reports " + _ref(snapshot, "F"), "section"))
+        for event in events[:3]:
+            codes = [code for code in event.items if code != "9.01"] or list(event.items)
+            labels = "; ".join(f"{code} {_EVENT_ITEMS.get(code, 'other disclosed item')}" for code in codes[:3])
+            link = _source_link(f"{event.form} filed {event.filing_date}", event.url)
+            story.append(_rich(f"{link} — {_esc(labels)}", "small"))
+        story.append(_p("Item codes identify the filing's subject, not whether an event was favorable or material to the thesis. Read the linked filing.", "muted"))
+    if snapshot.web_news:
+        news_heading = "Illustrative independent news" if snapshot.demo else "Recent news indexed by The GDELT Project"
+        story.append(_p(news_heading + " " + _ref(snapshot, "G"), "section"))
+        diversified = []
+        seen_themes = set()
+        for item in snapshot.web_news:
+            theme = news_theme(item.title)
+            if theme not in seen_themes:
+                diversified.append(item)
+                seen_themes.add(theme)
+        diversified.extend(item for item in snapshot.web_news if item not in diversified)
+        for item in diversified[:4]:
+            link = _source_link(text(item.title, 130), item.url)
+            story.append(_rich(f"{link} <font color='#60726e'>— {_esc(item.publisher)}, first seen {_esc(item.published_at[:10])}; {_esc(news_theme(item.title))}</font>", "small"))
+        news_note = ("These headlines are fictional; no independent provider was queried." if snapshot.demo else
+                     "GDELT's first-seen date may differ from publication. Keyword themes and issuer matching are imperfect; headlines and claims are not independently verified. Data: The GDELT Project, gdeltproject.org.")
+        story.append(_p(news_note, "muted"))
+    if snapshot.web_results:
+        story.append(_p("Broader indexed-web leads " + _ref(snapshot, "W"), "section"))
+        diversified = []
+        for topic in dict.fromkeys(item.topic for item in snapshot.web_results):
+            diversified.extend([item for item in snapshot.web_results if item.topic == topic][:2])
+        for item in diversified[:4]:
+            link = _source_link(text(item.title, 125), item.url)
+            story.append(_rich(f"{link} <font color='#60726e'>— {_esc(item.publisher)}, {_esc(item.published_at)}; {_esc(item.topic)}</font>", "small"))
+            if item.snippet:
+                story.append(_p("Search excerpt: “" + text(item.snippet, 165) + "”", "muted"))
+    elif not snapshot.web_search_enabled:
+        story.append(_p("Broader web search is optional and not configured. A server-side Brave Search key can add cited web leads; search fees and provider limits may apply.", "small"))
+    story.append(_note("These links are research leads, not established company facts or a complete survey of the internet. Dates and source context can be incomplete; verify each claim in its original source. They do not change the scorecard or its historical test."))
 
 def _positioning_page(story: list, snapshot: Snapshot, analysis: Analysis) -> None:
     _heading(story, 9, "Market positioning & risk", "Sentiment is more than a headline: compare trading activity, short interest and option positioning.")
@@ -406,7 +564,11 @@ def _investment_narrative(story: list, snapshot: Snapshot, analysis: Analysis) -
         operating.append(f"operating margin {pct(margin)}")
     if fcf is not None:
         operating.append(f"free cash flow {compact(fcf, financial_currency)}")
-    if operating:
+    operating_insight = next((item for item in analysis.research_insights if item.label == "Growth versus profitability"), None)
+    if operating_insight:
+        story.append(_p(operating_insight.evidence + " " + _ref(snapshot, operating_insight.source), "small"))
+        story.append(_p(text(operating_insight.implication, 210), "muted"))
+    elif operating:
         story.append(_p("Provider-reported operating evidence: " + "; ".join(operating) + ". These fields may cover different periods. " + _ref(snapshot, "Q"), "small"))
     if snapshot.filing and snapshot.filing.customer_excerpts:
         story.append(_p("Customer evidence to verify in context: “" + text(snapshot.filing.customer_excerpts[0], 180) + "” " + _ref(snapshot, "F"), "small"))
@@ -432,10 +594,6 @@ def _investment_narrative(story: list, snapshot: Snapshot, analysis: Analysis) -
     story.append(_p("This is a conditional transmission channel, not evidence that the yield move caused the stock's return. See sections 11–15 for other macro and policy exposures.", "muted"))
     if analysis.policy_channels:
         story.append(_p("Unscored policy watch: " + text(analysis.policy_channels[0][1], 220), "small"))
-    recent_event = next((item for item in analysis.election_reactions if item.return_63d is not None), None)
-    if recent_event:
-        story.append(_p(f"After the {recent_event.election_date} election, the ticker's 63-session adjusted return was {pct(recent_event.return_63d, signed=True)}. Other events coincided; this does not establish political causation. {_ref(snapshot, 'H')} {_ref(snapshot, 'E')}", "small"))
-
     story.append(_p("What could change the thesis", "section"))
     if snapshot.filing and snapshot.filing.risk_excerpts:
         risk = "The issuer disclosed: “" + text(snapshot.filing.risk_excerpts[0], 200) + "” " + _ref(snapshot, "F")
@@ -526,6 +684,7 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
         story.append(_table(["Symbol", "Holding", "Weight"], [[x, text(n, 55), pct(w) if w is not None else "Not available"] for x, n, w in snapshot.holdings[:5]], [95, 300, 115], small=True))
     story.append(Spacer(1, 8))
     story.append(_note("Investor question: which end markets, renewal cycles and large customers drive revenue, and how much bargaining power do they have? Verify any answer in the issuer's filings; a product list alone is not a customer list."))
+    _business_evidence_page(story, snapshot, analysis)
 
     # 04 / People
     _heading(story, 4, "Management & stewardship", "Known leadership, operating context and the questions that remain open.")
@@ -571,7 +730,10 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
         peers = "; ".join(f"{item.ticker} ({text(item.name, 32)}) {item.forward_pe:.1f}x" for item in snapshot.peers.members)
         fetched = snapshot.peers.retrieved_at.strftime("%Y-%m-%d %H:%M UTC")
         story.append(_p(f"Same-industry peer sample, retrieved {fetched}: {peers}. {_ref(snapshot, 'R')}", "small"))
-        story.append(_p("Positive forward P/Es only; the issuer is excluded. Provider industry membership and earnings estimates can change, and the small sample is not a complete peer universe.", "muted"))
+        peer_insight = next((item for item in analysis.research_insights if item.label == "Business quality versus peers"), None)
+        if peer_insight:
+            story.append(_p(peer_insight.evidence + " " + _ref(snapshot, "R"), "small"))
+        story.append(_p("Positive forward P/Es only; the issuer is excluded. Provider industry membership and estimates can change; fiscal periods and accounting definitions may differ, and the small sample is not a complete peer universe.", "muted"))
     else:
         story.append(_p("Comparable peer multiples were unavailable; no fixed sector P/E has been substituted.", "muted"))
 
@@ -592,9 +754,13 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
     if quarter_end:
         story.append(Spacer(1, 4))
         story.append(_p(f"Provider's most recent reported quarter ends {quarter_end}; individual metrics may use different periods. {_ref(snapshot, 'Q')}", "muted"))
-    if snapshot.annuals:
-        story.append(_p("Annual income statement history " + _ref(snapshot, "S"), "section"))
-        annual_rows = [[item.period_end.isoformat(), compact(item.revenue, financial_currency), compact(item.operating_income, financial_currency), compact(item.net_income, financial_currency)] for item in snapshot.annuals[:3]]
+    financial_annuals = selected_annuals(snapshot)
+    if financial_annuals:
+        annual_source = "X" if financial_annuals[0].source == "SEC XBRL" else "S"
+        story.append(_p("Annual income statement history " + _ref(snapshot, annual_source), "section"))
+        annual_rows = [[item.period_end.isoformat(), compact(item.revenue, item.currency or financial_currency),
+                        compact(item.operating_income, item.currency or financial_currency),
+                        compact(item.net_income, item.currency or financial_currency)] for item in financial_annuals[:3]]
         story.append(_table(["Period end", "Revenue", "Operating income", "Net income"], annual_rows, [105, 135, 135, 135], small=True))
     else:
         story.append(_p("Annual income statement history was not available; verify multi-year trends in the issuer's filings.", "muted"))
@@ -602,6 +768,7 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
     _bullet(story, "Growth signal.", _factor_evidence(snapshot, factors["growth"]))
     _bullet(story, "Profitability signal.", _factor_evidence(snapshot, factors["profitability"]))
     story.append(_note("Provider metrics may use different reporting periods and definitions. Growth and margins are not peer-normalized; banks, funds and early-stage businesses require special interpretation. Check the financial statements for period, non-recurring items and cash-flow quality."))
+    _financial_detail_page(story, snapshot, analysis)
 
     # 07 / Balance sheet
     _heading(story, 7, "Balance sheet & cash", "Liquidity and funding flexibility can determine whether a good business survives a bad cycle.")
@@ -621,13 +788,14 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
         ["Shares outstanding", _value(info, "sharesOutstanding", lambda v: compact(v))],
     ]
     story.append(_table(["Measure", "Observation"], rows, [250, 260]))
-    cash_rows = [[item.period_end.isoformat(), compact(item.operating_cash_flow, financial_currency),
-                  compact(item.capital_expenditure, financial_currency), compact(item.free_cash_flow, financial_currency)]
-                 for item in snapshot.annuals[:3] if any(v is not None for v in (item.operating_cash_flow, item.capital_expenditure, item.free_cash_flow))]
+    cash_rows = [[item.period_end.isoformat(), compact(item.operating_cash_flow, item.currency or financial_currency),
+                  compact(item.capital_expenditure, item.currency or financial_currency), compact(item.free_cash_flow, item.currency or financial_currency)]
+                 for item in financial_annuals[:3] if any(v is not None for v in (item.operating_cash_flow, item.capital_expenditure, item.free_cash_flow))]
     if cash_rows:
-        story.append(_p("Annual cash-flow history " + _ref(snapshot, "S"), "section"))
+        cash_source = "X" if financial_annuals[0].source == "SEC XBRL" else "S"
+        story.append(_p("Annual cash-flow history " + _ref(snapshot, cash_source), "section"))
         story.append(_table(["Period end", "Operating cash flow", "Capital expenditure", "Free cash flow"], cash_rows, [100, 140, 135, 135], small=True))
-        story.append(_p("Capital expenditure is shown with the provider's reported sign; missing values are not estimated.", "muted"))
+        story.append(_p("Yahoo capital expenditure keeps the provider's sign. SEC purchases of property and equipment are shown as a negative outflow; SEC free cash flow is operating cash flow less those purchases. Other definitions may differ.", "muted"))
     story.append(Spacer(1, 8))
     story.append(_p(_factor_evidence(snapshot, factors["balance"]), "body"))
     story.append(_p("What changes the thesis", "section"))
@@ -664,6 +832,7 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
 
     _positioning_page(story, snapshot, analysis)
     _sentiment_page(story, snapshot, analysis)
+    _independent_research_page(story, snapshot)
 
     # 11 / Macro snapshot
     _heading(story, 11, "The macro backdrop", "US indicators are observed independently; the transmission to this company is assessed next.")
@@ -762,6 +931,9 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
         _bullet(story, factor.label + ".", _factor_evidence(snapshot, factor))
     if not positive:
         story.append(_p(analysis.positives[0], "body"))
+    additional_upside = next((item for item in analysis.research_insights if item.direction == "positive"), None)
+    if additional_upside:
+        story.append(_p("Additional unscored evidence: " + text(additional_upside.evidence, 230) + " " + _ref(snapshot, additional_upside.source), "small"))
     story.append(_p("What needs to happen", "section"))
     story.append(_p(f"{snapshot.name} would need to sustain or improve its provider-reported revenue growth and operating margin, while retaining customers and funding its operations. Easier or stable financial conditions could help through {_sector_channel_for_report(sector)}; none of those outcomes is assumed to be certain.", "body"))
     story.append(_p("What would invalidate this case", "section"))
@@ -777,6 +949,9 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
         _bullet(story, factor.label + ".", _factor_evidence(snapshot, factor))
     if not negative:
         story.append(_p(analysis.negatives[0], "body"))
+    additional_risk = next((item for item in analysis.research_insights if item.direction in {"negative", "mixed"}), None)
+    if additional_risk:
+        story.append(_p("Additional unscored tension: " + text(additional_risk.evidence, 230) + " " + _ref(snapshot, additional_risk.source), "small"))
     if snapshot.filing and snapshot.filing.risk_excerpts:
         story.append(_p("Issuer disclosure to examine", "section"))
         story.append(_p('“' + text(snapshot.filing.risk_excerpts[0], 360) + '” ' + _ref(snapshot, "F"), "body"))
@@ -799,6 +974,11 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
         ["US 10-year yield", _macro_value(rate.value, rate.unit) if rate else "Unavailable", "Compare future yield changes with the rate and funding channels in section 12."],
         ["US unemployment", _macro_value(unemp.value, unemp.unit) if unemp else "Unavailable", "Watch for changing demand and credit conditions; check the issuer's actual customer mix."],
     ]
+    latest_quarters = selected_quarters(snapshot)
+    if latest_quarters and latest_quarters[0].revenue is not None:
+        quarter = latest_quarters[0]
+        watch_rows.insert(1, ["Quarterly sales", f"{quarter.period_end}: {compact(quarter.revenue, quarter.currency or financial_currency)}",
+                              "Compare with the same fiscal quarter a year earlier and examine the associated operating margin."])
     if analysis.next_election and snapshot.price_date <= analysis.next_election <= six_month_date:
         watch_rows.append(["US general election", analysis.next_election.isoformat(), "Review the relevant policy channels and avoid assuming an election outcome or price reaction."])
     story.append(_table(["Watch item", "Current reference", "Why it matters"], watch_rows, [115, 150, 245], small=True))
@@ -838,7 +1018,7 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
     exposures = EXPOSURES.get(sector)
     if exposures:
         story.append(_p(f"For the {sector} sector the assumed signed sensitivities are {exposures[0]:+.2f} for yields, {exposures[1]:+.2f} for unemployment and {exposures[2]:+.2f} for CPI. Upstream energy and airlines may additionally use oil at +1 or -1 respectively. These are assumptions, not measured correlations.", "small"))
-    story.append(_p("Provider financial fields may be stale, incomplete, revised or based on differing periods. No filing, analyst recommendation, customer list, macro correlation or financial value is fabricated when missing.", "muted"))
+    story.append(_p("The deeper financial comparisons, filing excerpts and broader-web leads are descriptive and do not alter this scorecard or its archived revision. Provider financial fields may be stale, incomplete, revised or based on differing periods. No customer list, causal claim or financial value is fabricated when missing.", "muted"))
 
     # 17 / Sources and limitations
     _heading(story, 23, "Sources & data gaps", "Source dates, audit trail and important boundaries for this point-in-time report.")
@@ -860,9 +1040,17 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
             for peer in snapshot.peers.members:
                 peer_url = quote(peer.ticker, safe="")
                 sources.append(("R", f"Peer {peer.ticker}: provider key statistics / forward P/E", f"https://finance.yahoo.com/quote/{peer_url}/key-statistics/"))
+        if snapshot.annuals or snapshot.quarters:
+            sources.append(("S", "Yahoo Finance annual and quarterly income statements", f"https://finance.yahoo.com/quote/{ticker_url}/financials/"))
         if snapshot.annuals:
-            sources.append(("S", "Yahoo Finance annual income statements", f"https://finance.yahoo.com/quote/{ticker_url}/financials/"))
             sources.append(("S", "Yahoo Finance annual cash-flow statements", f"https://finance.yahoo.com/quote/{ticker_url}/cash-flow/"))
+            sources.append(("S", "Yahoo Finance annual balance sheet", f"https://finance.yahoo.com/quote/{ticker_url}/balance-sheet/"))
+        if snapshot.web_news:
+            sources.append(("G", "The GDELT Project DOC 2.0 news index; individual headlines linked in section 10", "https://www.gdeltproject.org/"))
+        if snapshot.web_results:
+            sources.append(("W", "Brave Search indexed-web leads; individual results are linked in section 10", "https://search.brave.com/"))
+        if snapshot.company_profile:
+            sources.append(("K", "Wikidata community-maintained company profile", f"https://www.wikidata.org/wiki/{snapshot.company_profile.entity_id}"))
         if snapshot.benchmark_prices:
             sources.append(("B", "Yahoo Finance SPY adjusted historical prices", "https://finance.yahoo.com/quote/SPY/history/"))
         if snapshot.options:
@@ -876,6 +1064,11 @@ def create_report(snapshot: Snapshot, analysis: Analysis, output: str | Path) ->
         ])
         if snapshot.filing:
             sources.append(("F", f"SEC {snapshot.filing.form}, filed {snapshot.filing.filing_date}", snapshot.filing.url))
+            if snapshot.filing.latest_quarter:
+                quarter = snapshot.filing.latest_quarter
+                sources.append(("FQ", f"SEC {quarter.form}, filed {quarter.filing_date}", quarter.url))
+            if snapshot.filing.sec_annuals or snapshot.filing.sec_quarters:
+                sources.append(("X", "SEC Company Facts: entity-wide US-GAAP XBRL, selected comparable periods", snapshot.filing.companyfacts_url))
         for code, label, _unit, _kind, source_id in SERIES:
             point = snapshot.macro.get(code)
             observed = f"observed {point.as_of}" if point else "no usable observation retrieved"
