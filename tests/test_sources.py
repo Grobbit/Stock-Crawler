@@ -3,9 +3,9 @@ from datetime import date
 import pandas as pd
 import pytest
 
+from stock_crawler.sources import market
 from stock_crawler.sources.fred import parse_series
 from stock_crawler.sources.sec import _valid_agent, extract_excerpts, fetch_filing
-from stock_crawler.sources import market
 
 
 def test_fred_changes_use_dates_not_fixed_number_of_rows():
@@ -116,7 +116,11 @@ def test_optional_source_failure_does_not_crash_collection(monkeypatch):
     monkeypatch.setattr(collector, "fetch_macro", fail)
     monkeypatch.setattr(collector, "fetch_filing", fail)
     monkeypatch.setattr(collector, "fetch_annual_financials", fail)
+    monkeypatch.setattr(collector, "fetch_quarterly_financials", fail)
     monkeypatch.setattr(collector, "fetch_news", fail)
+    monkeypatch.setattr(collector, "fetch_web_news", fail)
+    monkeypatch.setattr(collector, "fetch_company_profile", fail)
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
     monkeypatch.setattr(collector, "fetch_political_context", fail)
     monkeypatch.setattr(collector, "fetch_benchmark", fail)
     monkeypatch.setattr(collector, "fetch_options", fail)
@@ -127,7 +131,7 @@ def test_optional_source_failure_does_not_crash_collection(monkeypatch):
     assert snapshot.prices
     assert snapshot.macro == {}
     assert snapshot.filing is None
-    assert len(snapshot.warnings) == 9
+    assert len(snapshot.warnings) == 12
 
 
 def test_cpi_does_not_substitute_a_different_month_for_year_over_year():
@@ -157,6 +161,7 @@ def test_history_retains_adjusted_close_volume_and_sorts_unique_dates():
 def test_options_chain_reports_incomplete_data_without_fabricating_a_ratio(monkeypatch):
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
+
     from stock_crawler.demo import demo_snapshot
     from stock_crawler.research_context import positioning
     expiry = (datetime.now(timezone.utc).date() + timedelta(days=45)).isoformat()

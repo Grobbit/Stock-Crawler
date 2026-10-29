@@ -61,7 +61,9 @@ def fetch_peers(ticker: str, info: dict) -> tuple[PeerGroup | None, list[str]]:
             if multiple is None or multiple <= 0:
                 return None
             return PeerValuation(symbol, text(other.get("shortName") or other.get("longName") or symbol, 80),
-                                 other_industry or industry, multiple)
+                                 other_industry or industry, multiple,
+                                 revenue_growth=number(other.get("revenueGrowth")),
+                                 operating_margin=number(other.get("operatingMargins")))
         except Exception:
             return None
 

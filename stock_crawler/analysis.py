@@ -11,11 +11,30 @@ from datetime import timedelta
 
 from dateutil.relativedelta import relativedelta
 
-from stock_crawler.backtest import range_log_parameters, realized_volatility, run_backtest, run_recorded_backtest
+from stock_crawler.backtest import (
+    range_log_parameters,
+    realized_volatility,
+    run_backtest,
+    run_recorded_backtest,
+)
+from stock_crawler.financial_research import research_insights
 from stock_crawler.models import Analysis, Factor, PriceRange, Snapshot
+from stock_crawler.research_context import (
+    election_reactions,
+    headline_sentiment,
+    next_general_election,
+    policy_channels,
+    positioning,
+)
 from stock_crawler.sources.peers import MIN_PEERS
-from stock_crawler.research_context import election_reactions, headline_sentiment, next_general_election, policy_channels, positioning
-from stock_crawler.utils import MINOR_UNIT_CURRENCIES, compact, days_old, number, pct, text
+from stock_crawler.utils import (
+    MINOR_UNIT_CURRENCIES,
+    compact,
+    days_old,
+    number,
+    pct,
+    text,
+)
 
 WEIGHTS = {
     "growth": 0.17,
@@ -305,4 +324,4 @@ def analyze(snapshot: Snapshot) -> Analysis:
                     positives=positives, negatives=negatives, limitations=limitations, returns=returns, data_stale=stale,
                     sentiment=sentiment, election_reactions=election_reactions(snapshot),
                     next_election=next_general_election(snapshot.fetched_at.date()), positioning=positioning(snapshot),
-                    policy_channels=policy_channels(snapshot))
+                    policy_channels=policy_channels(snapshot), research_insights=research_insights(snapshot))
